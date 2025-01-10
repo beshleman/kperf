@@ -55,6 +55,7 @@ struct session_state_devmem {
 	int dmabuf_fd;
 	int udmabuf_devfd;
 	int udmabuf_memfd;
+	__u32 rss_context;
 	bool udmabuf_valid;
 };
 
