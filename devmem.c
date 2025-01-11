@@ -131,7 +131,7 @@ static int rss_context_delete(struct session_state_devmem *devmem)
 	return 0;
 }
 
-static int rss_context_equal(const char *ifname, int max_queue, __u32 *context)
+static int rss_context_equal(const char *ifname, int num_queues, __u32 *context)
 {
 	struct ethtool_rxfh get = {};
 	struct ethtool_rxfh *set;
@@ -143,7 +143,7 @@ static int rss_context_equal(const char *ifname, int max_queue, __u32 *context)
 
 	get.cmd = ETHTOOL_GRSSH;
 	if (ethtool(ifname, &get) < 0) {
-		warn("ethtool failed to get RSS context");
+		warn("ethtool failed to get RSS context for %s", ifname);
 		return -1;
 	}
 
@@ -161,7 +161,7 @@ static int rss_context_equal(const char *ifname, int max_queue, __u32 *context)
 
 	for (__u32 i = 0; i < get.indir_size; i++) {
 		set->rss_config[i] = queue++;
-		if (queue >= max_queue)
+		if (queue >= num_queues)
 			queue = 0;
 	}
 
@@ -212,14 +212,27 @@ static int rss_context_add_rule(struct sockaddr_in6 *server_sin,
 	return ethtool(ifname, &add);
 }
 
-static int rss_context_setup(struct session_state_devmem *devmem, int max_queue,
+#if DEBUG
+static void ethtool_show_rss_context(struct session_state_devmem *devmem)
+{
+	char command[256];
+
+	snprintf(command, 256, "ethtool -x %s context %u", devmem->ifname, devmem->rss_context);
+	system(command);
+
+	snprintf(command, 256, "ethtool -n %s", devmem->ifname);
+	system(command);
+}
+#endif
+
+static int rss_context_setup(struct session_state_devmem *devmem, int num_queues,
 			     struct sockaddr_in6 *addr)
 {
 	int ret;
 
 	devmem->rss_context = 0;
 
-	if (rss_context_equal(devmem->ifname, max_queue, &devmem->rss_context) < 0)
+	if (rss_context_equal(devmem->ifname, num_queues, &devmem->rss_context) < 0)
 		return -1;
 
 	if (rss_context_add_rule(addr, devmem->ifname, devmem->rss_context) < 0) {
@@ -469,7 +482,7 @@ static int find_iface(struct sockaddr_in6 *addr, char ifname[IFNAMSIZ])
 }
 
 int devmem_setup(struct session_state_devmem *devmem, int fd,
-		 size_t udmabuf_size_mb)
+		 size_t udmabuf_size_mb, unsigned int num_rx_queues)
 {
 	struct netdev_queue_id *queues;
 	char ifname[IFNAMSIZ] = {};
@@ -477,7 +490,6 @@ int devmem_setup(struct session_state_devmem *devmem, int fd,
 	struct ynl_error yerr;
 	int max_kernel_queue;
 	socklen_t optlen;
-	int num_queues;
 	int ifindex;
 	int rxqn;
 	int ret;
@@ -497,6 +509,8 @@ int devmem_setup(struct session_state_devmem *devmem, int fd,
 		return -1;
 	}
 
+	memcpy(devmem->ifname, ifname, IFNAMSIZ);
+
 	devmem->ys = ynl_sock_create(&ynl_netdev_family, &yerr);
 	if (!devmem->ys) {
 		warnx("Failed to setup YNL socket: %s", yerr.msg);
@@ -510,6 +524,16 @@ int devmem_setup(struct session_state_devmem *devmem, int fd,
 		goto sock_destroy;
 	}
 
+	max_kernel_queue = rxqn - 1;
+
+	if (num_rx_queues > (unsigned int)max_kernel_queue) {
+		/* TODO: reply error to client */
+		warn("Requested number of queues (%u) exceeds max RX queues (%d)",
+		      num_rx_queues, max_kernel_queue);
+		ret = -1;
+		goto sock_destroy;
+	}
+
 	ret = udmabuf_alloc(devmem, udmabuf_size_mb);
 	if (ret < 0) {
 		warnx("Failed to allocate udmabuf: %s", strerror(-ret));
@@ -517,24 +541,21 @@ int devmem_setup(struct session_state_devmem *devmem, int fd,
 		goto sock_destroy;
 	}
 
-	/* TODO: support more than one queue */
-	max_kernel_queue = rxqn - 1;
-	num_queues = 1;
-
 	reset_flow_steering(ifname);
 
 	/*
 	 * Try to use RSS context if supported, otherwise fallback to
 	 * normal RSS.
 	 */
-	if (rss_context_setup(devmem, max_kernel_queue, &addr) < 0) {
+	ret = rss_context_setup(devmem, num_rx_queues, &addr);
+	if (ret < 0) {
 		if (rss_equal(ifname, max_kernel_queue)) {
 			warnx("Failed to setup RSS");
 			ret = -1;
 			goto free_udmabuf;
 		}
 
-		for (int i = 0; i < num_queues; i++) {
+		for (unsigned int i = 0; i < num_rx_queues; i++) {
 			if (add_steering_rule(&addr, ifname, max_kernel_queue + i, i)) {
 				warnx("Failed to setup flow steering");
 				ret = -1;
@@ -543,29 +564,27 @@ int devmem_setup(struct session_state_devmem *devmem, int fd,
 		}
 	}
 
-	queues = calloc(num_queues, sizeof(*queues));
+	queues = calloc(num_rx_queues, sizeof(*queues));
 	if (!queues) {
 		warn("Failed to allocate memory for queues");
 		ret = -1;
 		goto undo_rss;
 	}
 
-	for (int i = 0; i < num_queues; i++) {
+	for (unsigned int i = 0; i < num_rx_queues; i++) {
 		queues[i]._present.type = 1;
 		queues[i]._present.id = 1;
 		queues[i].type = NETDEV_QUEUE_TYPE_RX;
-		queues[i].id = max_kernel_queue + i;
+		queues[i].id = i;
 	}
 
         devmem->dmabuf_id = bind_rx_queue(ifindex, devmem->dmabuf_fd, queues,
-                                          num_queues, devmem->ys);
+                                          num_rx_queues, devmem->ys);
         if (devmem->dmabuf_id < 0) {
 		warnx("Failed to bind RX queue");
 		ret = -1;
 		goto free_queues;
 	}
-
-	memcpy(devmem->ifname, ifname, IFNAMSIZ);
 
 	return 0;
 
