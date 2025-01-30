@@ -27,6 +27,7 @@ static struct {
 	bool devmem_rx;
 	enum memory_provider_type devmem_rx_memory;
 	struct pci_dev devmem_dst_dev;
+	bool devmem_tx;
 	bool msg_zerocopy;
 	bool tls;
 	bool tls_rx;
@@ -702,8 +703,13 @@ int main(int argc, char *argv[])
 	if (opt.validate && opt.devmem_rx_memory == MEMORY_PROVIDER_CUDA)
 		errx(1, "--devmem-rx-memory cuda does not support --validate yes");
 
+	if (opt.msg_zerocopy && opt.devmem_tx)
+		errx(1, "--msg-zerocopy and --devmem-tx are mutually exclusive");
+
 	if (opt.msg_zerocopy)
 		tx_mode = KPM_TX_MODE_SOCKET_ZEROCOPY;
+	else if (opt.devmem_tx)
+		tx_mode = KPM_TX_MODE_DEVMEM;
 
 	src_wrk_id = calloc(opt.n_conns, sizeof(*src_wrk_id));
 	dst_wrk_id = calloc(opt.n_conns, sizeof(*dst_wrk_id));
