@@ -26,6 +26,7 @@ static struct {
 	bool devmem_rx;
 	char *devmem_rx_memory;
 	char *devmem_dst_dev;
+	bool devmem_tx;
 	bool msg_zerocopy;
 	bool tls;
 	bool tls_rx;
@@ -159,6 +160,7 @@ static const struct opt_table opts[] = {
 	OPT_EARLY_WITHOUT_ARG("--devmem-rx", opt_set_bool, &opt.devmem_rx, "Use TCP Devmem on receive"),
 	OPT_WITH_ARG("--devmem-rx-memory {cuda,host}", opt_set_charp, opt_show_charp,
 		     &opt.devmem_rx_memory, "Select the memory provider for TCP Devmem RX"),
+	OPT_WITHOUT_ARG("--devmem-tx", opt_set_bool, &opt.devmem_tx, "Use TCP Devmem on transmit"),
 	OPT_WITH_ARG("--udmabuf-size-mb <arg>", opt_set_uintval, opt_show_uintval,
 		     &opt.udmabuf_size_mb, "Size of RX udmabuf for TCP Devmem mode"),
 	OPT_WITH_ARG("--num-rx-queues <arg>", opt_set_uintval, opt_show_uintval,
@@ -656,7 +658,6 @@ int main(int argc, char *argv[])
 	else if (opt.devmem_rx)
 		rx_mode = KPM_RX_MODE_DEVMEM;
 
-
 	if (!strcmp(opt.devmem_rx_memory, "host")) {
 		rx_provider = MEMORY_PROVIDER_HOST;
 	} else if (!strcmp(opt.devmem_rx_memory, "cuda")) {
@@ -672,8 +673,13 @@ int main(int argc, char *argv[])
 		errx(1, "--devmem-rx-memory arg invalid: %s", opt.devmem_rx_memory);
 	}
 
+	if (opt.msg_zerocopy && opt.devmem_tx)
+		errx(1, "--msg-zerocopy and --devmem-tx are mutually exclusive");
+
 	if (opt.msg_zerocopy)
 		tx_mode = KPM_TX_MODE_SOCKET_ZEROCOPY;
+	else if (opt.devmem_tx)
+		tx_mode = KPM_TX_MODE_DEVMEM;
 
 	if (!strcmp(opt.devmem_dst_dev, "any")) {
 		dst_dev.domain = DEVICE_DOMAIN_ANY;
