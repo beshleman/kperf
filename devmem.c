@@ -791,7 +791,8 @@ int devmem_setup_conn(int fd, struct connection_devmem *devmem)
 	optlen = sizeof(addr);
 	if (getsockname(fd, (struct sockaddr *)&addr, &optlen) < 0) {
 		warn("Failed to query socket address");
-		return -1;
+		ret = -1;
+		goto sock_destroy;
 	}
 
 	if (addr.sin6_family == AF_INET)
@@ -800,13 +801,15 @@ int devmem_setup_conn(int fd, struct connection_devmem *devmem)
 	ifindex = find_iface(&addr, ifname);
 	if (ifindex < 0) {
 		warnx("Failed to resolve ifindex: %s", strerror(-ifindex));
-		return -1;
+		ret = -1;
+		goto sock_destroy;
 	}
 
 	if (udmabuf_alloc(&devmem->mem, "udmabuf-test-tx",
 			  ROUND_UP(sizeof(patbuf), 1024 * 1024)) < 0) {
 		warnx("Failed to allocate devmem tx buffer");
-		return -1;
+		ret = -1;
+		goto sock_destroy;
 	}
 
 	devmem->mem.dmabuf_id = bind_tx_queue(ifindex, devmem->mem.fd,
@@ -834,6 +837,9 @@ int devmem_setup_conn(int fd, struct connection_devmem *devmem)
 
 free_udmabuf:
 	udmabuf_free(&devmem->mem);
+sock_destroy:
+	ynl_sock_destroy(devmem->ys);
+	devmem->ys = NULL;
 	return ret;
 }
 
