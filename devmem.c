@@ -29,7 +29,7 @@
 
 #include "server.h"
 
-#define ROUND_UP(n, d) (((n) + (d) - 1) / (d))
+#define ROUND_UP(n, d) ((((n) + (d) - 1) / (d)) * (d))
 
 extern unsigned char patbuf[KPM_MAX_OP_CHUNK + PATTERN_PERIOD + 1];
 
