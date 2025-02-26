@@ -53,24 +53,33 @@ struct memory_buffer {
 	bool valid;
 };
 
+struct memory_provider {
+	struct memory_buffer *(*alloc)(size_t size);
+	void (*free)(struct memory_buffer *mem);
+	void (*memcpy_to_device)(struct memory_buffer *dst, size_t off,
+				 void *src, int n);
+	void (*memcpy_from_device)(void *dst, struct memory_buffer *src,
+				   size_t off, int n);
+};
+
 struct connection_devmem {
 	struct dmabuf_token rxtok[128];
 	int rxtok_len;
 	/* ncdevmem uses 80k, allocate 64k for recvmsg tokens */
 	char ctrl_data[64 * 1024];
-	struct memory_buffer mem;
+	struct memory_buffer *mem;
 	struct ynl_sock *ys;
 };
 
 struct session_state_devmem {
 	struct ynl_sock *ys;
 	char ifname[IFNAMSIZ];
-	struct memory_buffer mem;
+	struct memory_buffer *mem;
 	int rss_context;
 };
 
 struct worker_state_devmem {
-	struct memory_buffer mem;
+	struct memory_buffer *mem;
 };
 
 struct server_session *
