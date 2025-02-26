@@ -513,9 +513,26 @@ server_msg_mode(struct session_state *self, struct kpm_header *hdr)
 
 	if (self->tcp_sock && req->rx_mode == KPM_RX_MODE_DEVMEM) {
 		ret = devmem_setup(&self->devmem, self->tcp_sock, req->udmabuf_size_mb,
-				   req->num_rx_queues);
+				   req->num_rx_queues, req->rx_provider,
+				   &req->dev);
 		if (ret < 0) {
 			warnx("Failed to setup devmem");
+			self->quit = 1;
+			return;
+		}
+	}
+
+	/*
+	 * Initialize the pattern before doing any TX setup. Some TX modes
+	 * (e.g., devmem) require that patbuf be initialized before the worker
+	 * is forked.
+	 */
+	patbuf_init();
+
+	if (req->tx_mode == KPM_TX_MODE_DEVMEM) {
+		ret = devmem_setup_tx(&self->devmem, req->tx_provider, &req->dev);
+		if (ret < 0) {
+			warnx("Failed to setup devmem_tx");
 			self->quit = 1;
 			return;
 		}
@@ -554,6 +571,7 @@ server_msg_spawn_pworker(struct session_state *self, struct kpm_header *hdr)
 		goto err_free;
 
 	pwrk->pid = fork();
+
 	if (pwrk->pid < 0) {
 		warn("Failed to fork");
 		goto err_free;
@@ -561,7 +579,7 @@ server_msg_spawn_pworker(struct session_state *self, struct kpm_header *hdr)
 	if (!pwrk->pid) {
 		close(p[0]);
 		pworker_main(p[1], self->rx_mode, self->tx_mode, self->devmem.mem,
-			     self->validate);
+			     self->validate, self->devmem.tx_mem);
 		exit(1);
 	}
 
@@ -730,7 +748,10 @@ bad_req:
 			 KPM_MSG_WORKER_TEST);
 		for (j = 0; j < msg->n_conns; j++) {
 			conn = session_find_connection_by_id(self, msg->specs[j].connection_id);
+
 			fdpass_send(pwrk->fd, conn->fd);
+			if (self->tx_mode == KPM_TX_MODE_DEVMEM)
+				fdpass_send(pwrk->fd, self->devmem.tx_mem->fd);
 		}
 	}
 

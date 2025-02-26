@@ -274,6 +274,15 @@ worker_msg_test(struct worker_state *self, struct kpm_header *hdr)
 		conn->id = req->specs[i].connection_id;
 		conn->fd = fdpass_recv(self->main_sock);
 
+		if (self->tx_mode == KPM_TX_MODE_DEVMEM) {
+			conn->devmem.tx_mem = self->devmem.tx_mem;
+			conn->devmem.tx_mem->fd = fdpass_recv(self->main_sock);
+			if (devmem_setup_conn(conn->fd, &conn->devmem) < 0) {
+				self->quit = 1;
+				return;
+			}
+		}
+
 		info_len = sizeof(conn->init_info);
 		if (getsockopt(conn->fd, IPPROTO_TCP, TCP_INFO,
 			       (void *)&conn->init_info, &info_len) < 0) {
@@ -331,13 +340,6 @@ worker_msg_test(struct worker_state *self, struct kpm_header *hdr)
 			warnx("Failed to set SO_ZEROCOPY");
 			self->quit = 1;
 			return;
-		}
-
-		if (self->tx_mode == KPM_TX_MODE_DEVMEM) {
-			if (devmem_setup_conn(conn->fd, &conn->devmem) < 0) {
-				self->quit = 1;
-				return;
-			}
 		}
 
 		ev.events = EPOLLIN | EPOLLOUT;
@@ -753,14 +755,15 @@ void patbuf_init(void)
 /* == Main loop == */
 
 void NORETURN pworker_main(int fd, enum kpm_rx_mode rx_mode, enum kpm_tx_mode tx_mode,
-			   struct memory_buffer *devmem, bool validate)
+			   struct memory_buffer *devmem, bool validate,
+			   struct memory_buffer *tx_mem)
 {
 	struct worker_state self = {
 		.main_sock = fd,
 		.rx_mode = rx_mode,
 		.tx_mode = tx_mode,
 		.validate = validate,
-		.devmem = { .mem = devmem },
+		.devmem = { .mem = devmem, .tx_mem = tx_mem },
 	};
 	struct epoll_event ev, events[32];
 	int i, nfds;

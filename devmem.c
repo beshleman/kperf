@@ -29,9 +29,25 @@
 
 #include "server.h"
 
+#ifdef USE_CUDA
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+#ifdef CU_MEM_RANGE_FLAG_DMA_BUF_MAPPING_TYPE_PCIE
+#define CUDA_FLAGS CU_MEM_RANGE_FLAG_DMA_BUF_MAPPING_TYPE_PCIE
+#else
+#define CUDA_FLAGS 0
+#endif
+#endif
+
 #define ROUND_UP(n, d) ((((n) + (d) - 1) / (d)) * (d))
 
 extern unsigned char patbuf[KPM_MAX_OP_CHUNK + PATTERN_PERIOD + 1];
+
+static struct memory_provider *rxmp;
+static struct memory_provider *txmp;
+
+extern int verbose;
 
 static int ethtool(const char *ifname, void *data)
 {
@@ -503,11 +519,217 @@ static struct memory_provider udmabuf_memory_provider = {
 	.memcpy_to_device = udmabuf_memcpy_to_device,
 };
 
-static struct memory_provider *mp = &udmabuf_memory_provider;
+#ifdef USE_CUDA
+
+ /* Length of str: 'XXXX:XX:XX' */
+#define MAX_BUS_ID_LEN 11
+
+static int cuda_find_device(__u16 domain, __u8 bus, __u8 device)
+{
+	char bus_id[MAX_BUS_ID_LEN];
+	int devnum;
+	int ret;
+
+	ret = snprintf(bus_id, MAX_BUS_ID_LEN, "%hx:%hhx:%hhx", domain, bus, device);
+	if (ret < 0)
+		return -EINVAL;
+
+	ret = cudaDeviceGetByPCIBusId(&devnum, bus_id);
+	if (ret != cudaSuccess) {
+		warnx("No CUDA device found %s", bus_id);
+		return -EINVAL;
+	}
+
+	return devnum;
+}
+
+static int cuda_dev_init(struct pci_dev *dev)
+{
+	struct cudaDeviceProp deviceProp;
+	CUdevice cuda_dev;
+	int devnum;
+	int ret;
+	int ok;
+
+	ret = cuInit(0);
+	if (ret != CUDA_SUCCESS)
+		return -1;
+
+	/* If the user did not specify a device, select any device */
+	if (dev->domain == DEVICE_DOMAIN_ANY && dev->bus == DEVICE_BUS_ANY && dev->device == DEVICE_DEVICE_ANY) {
+		devnum = 0;
+	} else {
+		devnum = cuda_find_device(dev->domain, dev->bus, dev->device);
+		if (devnum < 0)
+			return -1;
+	}
+
+	ret = cuDeviceGet(&cuda_dev, devnum);
+	if (ret != CUDA_SUCCESS)
+		return -1;
+
+	ok = 0;
+	ret = cuDeviceGetAttribute(&ok, CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED,
+				   cuda_dev);
+	if (ret != CUDA_SUCCESS || !ok) {
+		if (!ok)
+			warnx("CUDA device does not support dmabuf");
+		return -1;
+	}
+
+	ret = cudaSetDevice(devnum);
+	if (ret != cudaSuccess) {
+		warn("cudaSetDevice() failed with error %d", ret);
+		return -1;
+	}
+
+	if (verbose > 2)
+		printf("cuda: tid %d selecting device %d (%s)\n", getpid(), devnum, deviceProp.name);
+
+	return 0;
+}
+
+static struct memory_buffer *cuda_alloc(size_t size)
+{
+	struct memory_buffer *mem;
+	size_t page_size;
+	CUcontext ctx;
+	CUdevice dev;
+	int devnum;
+	int ret;
+
+	page_size = sysconf(_SC_PAGESIZE);
+	if (size % page_size) {
+		warnx("cuda memory size not aligned, size 0x%lx", size);
+		return NULL;
+	}
+
+	ret = cudaGetDevice(&devnum);
+	if (ret != cudaSuccess)
+		return NULL;
+
+	ret = cuDeviceGet(&dev, devnum);
+	if (ret != CUDA_SUCCESS)
+		return NULL;
+
+	ret = cuCtxCreate(&ctx, 0, dev);
+	if (ret != CUDA_SUCCESS)
+		return NULL;
+
+	mem = calloc(1, sizeof(*mem));
+	if (!mem)
+		goto destroy_ctx;
+
+	mem->size = size;
+
+	ret = cuMemAlloc((CUdeviceptr *)&mem->buf_mem, size);
+	if (ret != CUDA_SUCCESS)
+		goto free_mem;
+
+	ret = cuMemGetHandleForAddressRange((void *)&mem->fd, ((CUdeviceptr)mem->buf_mem),
+					    size, CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD,
+					    CUDA_FLAGS);
+	if (ret != CUDA_SUCCESS)
+		goto free_cuda;
+
+	if (verbose > 2)
+		printf("cuda: tid %d memory location %p\n", getpid(), mem->buf_mem);
+
+	mem->valid = true;
+
+	return mem;
+
+free_cuda:
+	if (cuMemFree((CUdeviceptr)mem->buf_mem) != CUDA_SUCCESS)
+		warnx("cuMemFree() failed\n");
+free_mem:
+	free(mem);
+destroy_ctx:
+	if (cuCtxDestroy(ctx) != CUDA_SUCCESS)
+		warnx("cuCtxDestroy() failed\n");
+
+	return NULL;
+}
+
+static void cuda_free(struct memory_buffer *mem)
+{
+	if (mem->valid) {
+		close(mem->fd);
+		close(mem->memfd);
+		close(mem->devfd);
+		munmap(mem->buf_mem, mem->size);
+		mem->valid = false;
+	}
+}
+
+int cuda_memcpy_to_device(struct memory_buffer *dst, size_t off,
+			   void *src, int n)
+{
+	int ret;
+
+	ret = cuMemcpyHtoD((CUdeviceptr)(dst->buf_mem + off), src, n);
+
+	return ret == CUDA_SUCCESS ? 0 : -1;
+}
+
+static struct memory_provider cuda_memory_provider = {
+	.dev_init = cuda_dev_init,
+	.alloc = cuda_alloc,
+	.free = cuda_free,
+	.memcpy_to_device = cuda_memcpy_to_device,
+};
+#endif
+
+static struct memory_provider *get_memory_provider(enum memory_provider_type provider)
+{
+	switch (provider) {
+	case MEMORY_PROVIDER_HOST:
+		return &udmabuf_memory_provider;
+#ifdef USE_CUDA
+	case MEMORY_PROVIDER_CUDA:
+		return &cuda_memory_provider;
+#endif
+	default:
+		warn("invalid provider: %d", provider);
+		return NULL;
+	}
+}
+
+static int devmem_assign_memory_provider(enum memory_provider_type provider, bool rx)
+{
+	struct memory_provider *mp;
+
+	mp = get_memory_provider(provider);
+	if (rx)
+		rxmp = mp;
+	else
+		txmp = mp;
+	return 0;
+}
+
+int devmem_setup_tx(struct session_state_devmem *devmem, enum memory_provider_type provider, struct pci_dev *dev)
+{
+	if (devmem_assign_memory_provider(provider, false) < 0)
+		return -1;
+
+	if (txmp->dev_init && txmp->dev_init(dev) < 0)
+		return -1;
+
+	devmem->tx_mem = txmp->alloc(ROUND_UP(sizeof(patbuf), 1024 * 1024));
+	if (!devmem->tx_mem) {
+		warnx("Failed to allocate devmem tx buffer");
+		return -1;
+	}
+
+	txmp->memcpy_to_device(devmem->tx_mem, 0, patbuf, sizeof(patbuf));
+	return 0;
+}
 
 /* Setup Devmem RX */
 int devmem_setup(struct session_state_devmem *devmem, int fd,
-		 size_t udmabuf_size_mb, int num_queues)
+		 size_t udmabuf_size_mb, int num_queues,
+		 enum memory_provider_type provider,
+		 struct pci_dev *dev)
 {
 	struct netdev_queue_id *queues;
 	char ifname[IFNAMSIZ] = {};
@@ -529,6 +751,9 @@ int devmem_setup(struct session_state_devmem *devmem, int fd,
 		warn("Failed to query socket address");
 		return -1;
 	}
+
+	if (devmem_assign_memory_provider(provider, true) < 0)
+		return -1;
 
 	if (addr.sin6_family == AF_INET)
 		inet_to_inet6((void *)&addr, &addr);
@@ -552,9 +777,14 @@ int devmem_setup(struct session_state_devmem *devmem, int fd,
 		goto sock_destroy;
 	}
 
-	devmem->mem = mp->alloc(udmabuf_size_mb * 1024 * 1024);
+	if (rxmp->dev_init && rxmp->dev_init(dev) < 0) {
+		ret = -1;
+		goto sock_destroy;
+	}
+
+	devmem->mem = rxmp->alloc(udmabuf_size_mb * 1024 * 1024);
 	if (!devmem->mem) {
-		warnx("Failed to allocate udmabuf");
+		warnx("Failed to allocate memory");
 		ret = -1;
 		goto sock_destroy;
 	}
@@ -604,7 +834,6 @@ int devmem_setup(struct session_state_devmem *devmem, int fd,
 		ret = -1;
 		goto free_queues;
 	}
-
 	return 0;
 
 free_queues:
@@ -614,7 +843,7 @@ undo_rss_context:
 undo_rss:
 	rss_equal(ifname, rxqn);
 free_udmabuf:
-	mp->free(devmem->mem);
+	rxmp->free(devmem->mem);
 sock_destroy:
 	ynl_sock_destroy(devmem->ys);
 	devmem->ys = NULL;
@@ -637,7 +866,8 @@ int devmem_teardown(struct session_state_devmem *devmem)
 	}
 	if (devmem->ys)
 		ynl_sock_destroy(devmem->ys);
-	mp->free(devmem->mem);
+	rxmp->free(devmem->mem);
+	txmp->free(devmem->tx_mem);
 	return 0;
 }
 
@@ -679,6 +909,7 @@ static int devmem_validate_token(struct memory_buffer *mem,
 	ioctl(mem->fd, DMA_BUF_IOCTL_SYNC, &sync);
 
 	pat = &patbuf[start];
+	/* TODO: memory_provider for CUDA case? */
 	ret = memcmp(pat, mem->buf_mem + dmabuf_cmsg->frag_offset, dmabuf_cmsg->frag_size);
 
 	sync.flags = DMA_BUF_SYNC_END;
@@ -772,6 +1003,12 @@ int devmem_sendmsg(int fd, struct connection_devmem *devmem, size_t off, size_t 
 	struct msghdr msg = { 0 };
 	struct cmsghdr *cmsg;
 	struct iovec iov;
+	int opt = 1;
+
+	if (setsockopt(fd, SOL_SOCKET, SO_ZEROCOPY, &opt, sizeof(opt))) {
+		warnx("failed to set SO_ZEROCOPY");
+		return -1;
+	}
 
 	iov.iov_base = (void *)off;
 	iov.iov_len = n;
@@ -786,7 +1023,7 @@ int devmem_sendmsg(int fd, struct connection_devmem *devmem, size_t off, size_t 
 	cmsg->cmsg_level = SOL_SOCKET;
 	cmsg->cmsg_type = SCM_DEVMEM_DMABUF;
 	cmsg->cmsg_len = CMSG_LEN(sizeof(int));
-	*((int *)CMSG_DATA(cmsg)) = devmem->mem->dmabuf_id;
+	*((int *)CMSG_DATA(cmsg)) = devmem->tx_mem->dmabuf_id;
 
 	return sendmsg(fd, &msg, MSG_SOCK_DEVMEM);
 }
@@ -799,20 +1036,12 @@ int devmem_setup_conn(int fd, struct connection_devmem *devmem)
 	struct ynl_error yerr;
 	socklen_t optlen;
 	int ifindex;
-	int opt = 1;
 	int ret;
-
-	devmem->ys = ynl_sock_create(&ynl_netdev_family, &yerr);
-	if (!devmem->ys) {
-		warnx("Failed to setup YNL socket: %s", yerr.msg);
-		return -1;
-	}
 
 	optlen = sizeof(addr);
 	if (getsockname(fd, (struct sockaddr *)&addr, &optlen) < 0) {
 		warn("Failed to query socket address");
-		ret = -1;
-		goto sock_destroy;
+		return -1;
 	}
 
 	if (addr.sin6_family == AF_INET)
@@ -821,42 +1050,31 @@ int devmem_setup_conn(int fd, struct connection_devmem *devmem)
 	ifindex = find_iface(&addr, ifname);
 	if (ifindex < 0) {
 		warnx("Failed to resolve ifindex: %s", strerror(-ifindex));
-		ret = -1;
-		goto sock_destroy;
+		return -1;
 	}
 
-	devmem->mem = mp->alloc(ROUND_UP(sizeof(patbuf), 1024 * 1024));
-	if (!devmem->mem) {
-		warnx("Failed to allocate devmem tx buffer");
-		ret = -1;
-		goto sock_destroy;
+	devmem->ys = ynl_sock_create(&ynl_netdev_family, &yerr);
+
+	if (!devmem->ys) {
+		warnx("Failed to setup YNL socket: %s", yerr.msg);
+		return -1;
 	}
 
-	devmem->mem->dmabuf_id = bind_tx_queue(ifindex, devmem->mem->fd,
+	devmem->tx_mem->dmabuf_id = bind_tx_queue(ifindex, devmem->tx_mem->fd,
 					      devmem->ys);
-	if (devmem->mem->dmabuf_id < 0) {
+	if (devmem->tx_mem->dmabuf_id < 0) {
 		ret = -1;
-		goto free_udmabuf;
+		goto sock_destroy;
 	}
-
-	mp->memcpy_to_device(devmem->mem, 0, patbuf, sizeof(patbuf));
 
 	if (setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, ifname, IFNAMSIZ)) {
 		warn("failed to bind device to socket");
 		ret = -1;
-		goto free_udmabuf;
-	}
-
-	if (setsockopt(fd, SOL_SOCKET, SO_ZEROCOPY, &opt, sizeof(opt))) {
-		warnx("failed to set SO_ZEROCOPY");
-		ret = -1;
-		goto free_udmabuf;
+		goto sock_destroy;
 	}
 
 	return 0;
 
-free_udmabuf:
-	mp->free(devmem->mem);
 sock_destroy:
 	ynl_sock_destroy(devmem->ys);
 	devmem->ys = NULL;
@@ -865,7 +1083,6 @@ sock_destroy:
 
 void devmem_teardown_conn(struct connection_devmem *devmem)
 {
-	mp->free(devmem->mem);
 	ynl_sock_destroy(devmem->ys);
 	devmem->ys = NULL;
 }
