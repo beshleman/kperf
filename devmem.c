@@ -961,10 +961,11 @@ ssize_t devmem_recv(int fd, struct connection_devmem *conn,
 {
 	struct msghdr msg = {};
 	struct iovec iov = {
-		.iov_base = rxbuf,
+		.iov_base = NULL,
 		.iov_len = chunk,
 	};
 	struct cmsghdr *cm;
+	int tokens = 0;
 	ssize_t n;
 	int ret;
 
@@ -972,7 +973,7 @@ ssize_t devmem_recv(int fd, struct connection_devmem *conn,
 	msg.msg_iovlen = 1;
 	msg.msg_control = conn->ctrl_data;
 	msg.msg_controllen = sizeof(conn->ctrl_data);
-	n = recvmsg(fd, &msg, MSG_SOCK_DEVMEM);
+	n = recvmsg(fd, &msg, MSG_DONTWAIT | MSG_SOCK_DEVMEM);
 	if (n < 0)
 		return n;
 
@@ -992,6 +993,13 @@ ssize_t devmem_recv(int fd, struct connection_devmem *conn,
 				return ret;
 		}
 
+		tokens++;
+	}
+
+	if (!tokens) {
+		warnx("devmem recvmsg returned no tokens");
+		errno = -EFAULT;
+		return -1;
 	}
 
 	return n;
