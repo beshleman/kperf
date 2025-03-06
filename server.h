@@ -99,4 +99,6 @@ int devmem_sendmsg(int fd, struct connection_devmem *devmem, size_t off, size_t 
 int devmem_setup_conn(int fd, struct connection_devmem *devmem);
 void devmem_teardown_conn(struct connection_devmem *devmem);
 
+void patbuf_init(void);
+
 #endif /* SERVER_H */
