@@ -96,4 +96,6 @@ ssize_t devmem_recv(int fd, struct connection_devmem *conn,
 		    unsigned char *rxbuf, size_t chunk, struct memory_buffer *mem,
 		    int rep, __u64 tot_recv, bool validate);
 
+void patbuf_init(void);
+
 #endif /* SERVER_H */

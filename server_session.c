@@ -978,6 +978,13 @@ static void server_session_loop(int fd)
 	struct epoll_event ev = {}, events[32];
 	struct connection *conn, *next;
 
+	/*
+	 * Initialize the pattern before doing any TX setup. Some TX modes
+	 * (e.g., devmem) copy this pattern before fork(), so we need to initialize
+	 * it early.
+	 */
+	patbuf_init();
+
 	list_head_init(&self.connections);
 	list_head_init(&self.pworkers);
 	list_head_init(&self.tests);
