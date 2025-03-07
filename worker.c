@@ -326,7 +326,7 @@ worker_msg_test(struct worker_state *self, struct kpm_header *hdr)
 		else
 			conn->to_recv = len;
 
-		zc = self->tx_mode == KPM_TX_MODE_SOCKET_ZEROCOPY;
+		zc = self->tx_mode == KPM_TX_MODE_SOCKET_ZEROCOPY || self->tx_mode == KPM_TX_MODE_DEVMEM;
 		if (setsockopt(conn->fd, SOL_SOCKET, SO_ZEROCOPY, &zc, sizeof(zc))) {
 			warnx("Failed to set SO_ZEROCOPY");
 			self->quit = 1;
