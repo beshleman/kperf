@@ -481,7 +481,7 @@ static int find_iface(struct sockaddr_in6 *addr, char ifname[IFNAMSIZ])
 	return -ENODEV;
 }
 
-void udmabuf_memcpy_to_device(struct memory_buffer *dst, size_t off,
+int udmabuf_memcpy_to_device(struct memory_buffer *dst, size_t off,
 			      void *src, int n)
 {
 	struct dma_buf_sync sync = {};
@@ -493,6 +493,8 @@ void udmabuf_memcpy_to_device(struct memory_buffer *dst, size_t off,
 
 	sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE;
 	ioctl(dst->fd, DMA_BUF_IOCTL_SYNC, &sync);
+
+	return 0;
 }
 
 static struct memory_provider udmabuf_memory_provider = {

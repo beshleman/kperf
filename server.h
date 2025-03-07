@@ -56,7 +56,7 @@ struct memory_buffer {
 struct memory_provider {
 	struct memory_buffer *(*alloc)(size_t size);
 	void (*free)(struct memory_buffer *mem);
-	void (*memcpy_to_device)(struct memory_buffer *dst, size_t off,
+	int (*memcpy_to_device)(struct memory_buffer *dst, size_t off,
 				 void *src, int n);
 	void (*memcpy_from_device)(void *dst, struct memory_buffer *src,
 				   size_t off, int n);
