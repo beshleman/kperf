@@ -1,0 +1,380 @@
+#!/bin/bash
+
+read -r USAGE <<EOF
+usage: $(basename $0) --dst DESTINATION --src SOURCE --nic NIC
+EOF
+
+read -r USAGE_LONG <<EOF
+${USAGE}
+
+required:
+	-d, --dst				destination machine
+	-s, --src				source machine
+	-dn, --dst-nic	NIC to use on destination.
+									Can use multiple times to select more than one NIC.
+	-sn, --src-nic	NIC to use on source.
+									Can use multiple times to select more than one NIC.
+optional:
+	-f, --flows			The number of flows (default: 1)
+	-v, --verbose		Enable verbose output (may be used multiple times to increase verbosity)
+EOF
+
+die() {
+	echo -e "$*" >&2
+	exit 1
+}
+
+NONE=0
+INFO=1
+DEBUG=2
+
+log_info() {
+	if (( ${LOG_LEVEL} < ${INFO} )); then
+		return
+	fi
+
+	echo -e "$*"
+}
+
+LOG_LEVEL=${NONE}
+
+declare -A NEED_VARS
+NEED_VARS[DESTINATION]="-d/--dst"
+NEED_VARS[SOURCE]="-s/--src"
+NEED_VARS[DST_NICS]="-dn/--dst-nic"
+NEED_VARS[SRC_NICS]="-sn/--src-nic"
+
+while [[ $# -gt 0 ]]; do
+	case $1 in
+		-d|--dst)
+			shift
+			DESTINATION=$1
+			;;
+		-s|--src)
+			shift
+			SOURCE=$1
+			;;
+		-dn|--dst-nic)
+			shift
+			DST_NICS+=($1)
+			;;
+		-sn|--src-nic)
+			shift
+			SRC_NICS+=($1)
+			;;
+		-f|--flows)
+			shift
+			FLOWS=$1
+			;;
+		-v|--verbose)
+			LOG_LEVEL=$(( LOG_LEVEL + 1 ))
+			;;
+		-vv|-vvv)
+			LOG_LEVEL=$(( LOG_LEVEL + (${#1} - 1) ))
+			;;
+		-h|--help)
+			echo "${USAGE_LONG}" >&1
+			exit 0
+	esac
+	shift
+done
+
+echo "logl=${LOG_LEVEL}"
+QUIET="-q"
+VERBOSE_SHELL_ON=""
+if (( ${LOG_LEVEL} >= ${INFO} )); then
+	QUIET=""
+	KPERF_CLIENT_ARGS=""
+fi
+if (( ${LOG_LEVEL} >= ${DEBUG} )); then
+	VERBOSE_SHELL_ON="set -x"
+	KPERF_CLIENT_ARGS="--verbose"
+fi
+
+FLOWS=${FLOWS:-1}
+QUEUES=$(( FLOWS )) # extra queues to force bipartite spread
+
+need_vars() {
+	local missing=()
+	for var in "${!NEED_VARS[@]}"; do
+		if [[ -z "${!var}" ]]; then
+			missing+=("${NEED_VARS[${var}]}")
+		fi
+	done
+
+	[[ ${#missing} -gt 0 ]] && {
+		die "${USAGE}\n\n$(basename $0): error: the following arguments are required: ${missing[*]}"
+	}
+}
+
+need_vars
+
+do_suscp2() {
+	suscp2 -q --reason "network testing with kperf" $*
+}
+
+do_sush2() {
+	local host=$1
+	shift
+
+	if [[ $# -eq 0 ]]; then
+		COMMAND=$(cat)
+	else
+		COMMAND="$*"
+	fi
+
+		sush2 --reason 'network testing with kperf' -q -t root@${host} <<EOF
+	set -e
+	(
+		set -e
+		${VERBOSE_SHELL_ON}
+		${COMMAND}
+	)
+EOF
+}
+
+query_ip() {
+	do_sush2 $1 ip -6 addr show dev $2 | grep global | grep -v deprecated | awk '{ print $2 }' | awk -F/ '{print $1}'
+}
+
+__setup_flow_control() {
+	local is_dst=$1
+
+	if [[ "${is_dst}" == "1" ]]; then
+		local NICS=("${DST_NICS[@]}")
+		local host=${DESTINATION}
+	else
+		local NICS=("${SRC_NICS[@]}")
+		local host=${SOURCE}
+	fi
+
+	if (( ${LOG_LEVEL} >= ${DEBUG} )); then
+		local TMP=$(mktemp)
+		echo "${host}: NIC Setup Before:"
+		do_sush2 ${host} > ${TMP}  <<-EOF
+			for nic in ${NICS[*]}; do
+				ethtool -l \$nic
+				ethtool -x \$nic
+			done
+		EOF
+
+		cat ${TMP} | awk '{ printf "'"$host"': "; print $0; }'
+		rm ${TMP}
+	fi
+
+	do_sush2 ${host} <<-EOF
+		for nic in ${NICS[@]}; do
+			for irq in \$(ls /sys/class/net/\${nic}/device/msi_irqs); do
+				cat /sys/class/net/\${nic}/device/local_cpulist > /proc/irq/\${irq}/smp_affinity_list
+			done
+		done
+	EOF
+
+	# kperf will pin CPUs to which ever core accepts the connection
+	# and so we want to spread these out accordingly using RSS.
+	do_sush2 ${host} <<-EOF
+		sysctl ${QUIET} net.core.optmem_max=8192000
+		for nic in ${NICS[@]}; do
+			# reset rss settings, to avoid getting hung up on existing indir tables
+			for ((i=0; i<16; i++)); do
+				ethtool -X \$nic context \$i delete 2>/dev/null || :
+				ethtool -N \$nic context \$i delete 2>/dev/null || :
+			done
+			ethtool -X \$nic equal 1 # reset indir table size
+
+			ip link set dev \$nic mtu 4200
+
+			ethtool -G \$nic tcp-data-split on
+			ethtool -K \$nic rx-gro-hw on
+			ethtool -L \$nic combined 63
+			ethtool -X \$nic equal 63
+			ethtool -C \$nic rx-usecs $2 rx-frames $3 tx-usecs $4 tx-frames $5
+		done
+	EOF
+
+	if (( ${LOG_LEVEL} >= ${DEBUG} )); then
+		local TMP=$(mktemp)
+		echo "${host}: NIC Setup Before:"
+		do_sush2 ${host} > ${TMP}  <<-EOF
+			for nic in ${NICS[*]}; do
+				ethtool -l \$nic
+				ethtool -x \$nic
+			done
+		EOF
+
+		cat ${TMP} | awk '{ printf "'"$host"': "; print $0; }'
+		rm ${TMP}
+	fi
+}
+
+setup_flow_control() {
+	local DEFAULT_COAL="3 32 16 32" # 400G
+	__setup_flow_control 1 $DEFAULT_COAL
+	__setup_flow_control 0 $DEFAULT_COAL
+	exit
+}
+
+declare -A SRC_IPS
+declare -A DST_IPS
+
+collect_ips() {
+	for nic in ${SRC_NICS[@]}; do
+		SRC_IPS[$nic]="$(query_ip ${SOURCE} ${nic})"
+	done
+
+	for nic in ${DST_NICS[@]}; do
+		DST_IPS[$nic]="$(query_ip ${DESTINATION} ${nic})"
+	done
+
+	for dev in ${!SRC_IPS[@]}; do
+		log_info "$SOURCE: dev $dev ip is ${SRC_IPS[$dev]}"
+	done
+
+	for dev in ${!DST_IPS[@]}; do
+		log_info "$DESTINATION: dev $dev ip is ${DST_IPS[$dev]}"
+	done
+}
+
+__add_routes() {
+	local src=$1
+	local dst=$2
+	local src_nic=$3
+	local dst_nic=$4
+	local pref="high"
+	local PARAMS="advmss $(( 4096 + 12 )) quickack 0 rto_min 5ms features tcp_usec_ts"
+
+	local via="fe80::face:b00c"
+	if [[ "$nic" == beth* ]]; then
+					local via="fe80::be:face:b00c"
+	fi
+
+	if [[ "${host}" == ${DESTINATION} ]]; then
+		do_sush2 ${host} <<-EOF
+			ip -6 route del ${SRC_IPS[$src_nic]} dev ${dst_nic} src ${DST_IPS[$dst_nic]} 2>/dev/null || :
+			ip -6 route add ${SRC_IPS[$src_nic]} dev ${dst_nic} via ${via} src ${DST_IPS[$dst_nic]} ${PARAMS} pref $pref || :
+		EOF
+	else
+		do_sush2 ${host} <<-EOF
+			ip -6 route del ${DST_IPS[$dst_nic]} dev ${src_nic} src ${SRC_IPS[$src_nic]} 2>/dev/null || :
+			ip -6 route add ${DST_IPS[$dst_nic]} dev ${src_nic} via ${via} src ${SRC_IPS[$src_nic]} ${PARAMS} pref $pref || :
+		EOF
+	fi
+}
+
+add_routes() {
+	if [[ ${#SRC_NICS[@]} < ${#DST_NICS[@]} ]]; then
+		NIC_CNT=${#SRC_NICS[@]}
+	else
+		NIC_CNT=${#DST_NICS[@]}
+	fi
+
+	for ((i = 0; i < NIC_CNT; i++)); do
+		src_nic=${SRC_NICS[i]}
+		dst_nic=${DST_NICS[i]}
+		__add_routes ${SOURCE} ${DESTINATION} ${src_nic} ${dst_nic}
+	done
+}
+
+copy_kperf() {
+	log_info "Copying kperf to machines..."
+	do_suscp2 ./server root@${SOURCE}:/root/
+	log_info "Copied ./server to ${SOURCE}:/root/"
+
+	do_suscp2 ./server root@${DESTINATION}:/root/
+	log_info "Copied ./server to ${DESTINATION}:/root/"
+
+	do_suscp2 ./client root@${SOURCE}:/root/
+	log_info "Copied ./client to ${SOURCE}:/root/"
+
+}
+
+kill_kperf_servers() {
+	do_sush2 ${SOURCE} 'LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/cuda-12.4/targets/x86_64-linux/lib ./server --kill'
+	do_sush2 ${DESTINATION} 'LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/cuda-12.4/targets/x86_64-linux/lib ./server --kill'
+}
+
+spawn_kperf_servers() {
+	do_sush2 ${SOURCE} 'LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/cuda-12.4/targets/x86_64-linux/lib nohup ./server --verbose > ./kperf.src.log'
+	do_sush2 ${DESTINATION} 'LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/cuda-12.4/targets/x86_64-linux/lib nohup ./server --verbose > ./kperf.dst.log'
+}
+
+run_kperf_client() {
+	local args=""
+	args="$args --pin-off ${FLOWS}"
+	args="$args --num-rx-queues ${FLOWS}"
+	args="$args --validate no"
+	args="$args -n ${FLOWS}"
+	args="$args $*"
+
+	log_info "Starting kperf test..."
+	local COMMAND="./client --src ${SOURCE} --dst ${DESTINATION} $args"
+	echo "${SOURCE}: ${COMMAND}"
+	sush2 --reason "networking testing with kperf" root@${SOURCE} -- ${COMMAND}
+}
+
+set_nic_smp_affinity() {
+	local host=$1
+	local device=$2
+
+	do_sush2 ${host} <<-EOF
+		cpulist=\$(cat /sys/class/net/${device}/device/local_cpulist)
+		segments=\$(echo \$cpulist | tr -cd ',' | wc -c)
+		segments=\$(( segments + 1 ))
+
+		irqs=()
+		irqs_len=0
+		for irq in \$(ls /sys/class/net/${device}/device/msi_irqs); do
+			irqs+=(\${irq})
+			irqs_len=\$(( irqs_len + 1 ))
+		done
+
+#		cpus=()
+#		for ((i = 0; i < segments; i++)); do
+#			range=\$(echo \${cpulist} | cut -d ',' -f \$(( i + 1 )) )
+#			lo="\$(echo \${range} | cut -d '-' -f1)"
+#			hi="\$(echo \${range} | cut -d '-' -f2)"
+#
+#			for ((cpu = lo; cpu <= hi; cpu++)); do
+#				cpus+=(\${cpu})
+#			done
+#		done
+
+		i=0
+		j=0
+
+		while [[ \${i} -lt \${irqs_len} ]]; do
+			irq=\${irqs[\${i}]}
+			echo "\${cpulist}" > /proc/irq/\${irq}/smp_affinity_list
+			i=\$(( i + 1 ))
+			j=\$(( j + 1 ))
+		done
+	EOF
+}
+
+# Build
+make clean && make -j$(nproc) USE_CUDA=1
+
+collect_ips
+setup_flow_control
+add_routes $SOURCE
+add_routes $DESTINATION
+
+#for nic in ${SRC_NICS[@]}; do
+#	set_nic_smp_affinity $SOURCE ${nic}
+#done
+
+#for nic in ${DST_NICS[@]}; do
+#	set_nic_smp_affinity $DESTINATION ${nic}
+#done
+
+kill_kperf_servers
+copy_kperf
+spawn_kperf_servers
+run_kperf_client							\
+	${KPERF_CLIENT_ARGS}				\
+#	--devmem-rx									\
+#	--devmem-tx									\
+#	--devmem-tx-memory cuda			\
+#	--devmem-rx-memory cuda			\
+#	--devmem-src-dev auto				\
+#	--devmem-dst-dev auto				\
