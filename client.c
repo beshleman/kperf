@@ -80,8 +80,8 @@ static struct {
 	.num_rx_queues = 1,
 	.devmem_rx_memory = "host",
 	.devmem_tx_memory = "host",
-	.devmem_src_dev = "any",
-	.devmem_dst_dev = "any",
+	.devmem_src_dev = "auto",
+	.devmem_dst_dev = "auto",
 };
 
 #define dbg(fmt...) while (0) { warnx(fmt); }
@@ -700,7 +700,7 @@ int main(int argc, char *argv[])
 	else if (opt.devmem_tx)
 		tx_mode = KPM_TX_MODE_DEVMEM;
 
-	if (!strcmp(opt.devmem_dst_dev, "any")) {
+	if (!strcmp(opt.devmem_dst_dev, "auto")) {
 		dst_dev.domain = DEVICE_DOMAIN_ANY;
 		dst_dev.bus = DEVICE_BUS_ANY;
 		dst_dev.device = DEVICE_DEVICE_ANY;
@@ -710,7 +710,7 @@ int main(int argc, char *argv[])
 		return -1;
 	}
 
-	if (!strcmp(opt.devmem_src_dev, "any")) {
+	if (!strcmp(opt.devmem_src_dev, "auto")) {
 		src_dev.domain = DEVICE_DOMAIN_ANY;
 		src_dev.bus = DEVICE_BUS_ANY;
 		src_dev.device = DEVICE_DEVICE_ANY;
