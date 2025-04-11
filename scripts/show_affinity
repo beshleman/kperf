@@ -1,0 +1,75 @@
+#!/bin/bash
+
+set -e
+
+get_mellanox_queues() {
+	local dev=$1
+
+	# Only support mlx5 right now
+	if [[ ! "$(realpath /sys/class/net/${dev}/device/driver)" =~ mlx5_core ]]; then
+		echo "Device ${dev} not an mlx5 device"
+		exit 1
+	fi
+
+	# Ignore the mlx5 async EQ irq
+	cat /proc/interrupts \
+		| grep $(basename $(realpath /sys/class/net/${dev}/device)) \
+		| grep -v mlx5_async \
+		| awk '{print $(NF - 1)}'
+}
+
+get_mellanox_irqs_for_queue() {
+	local dev=$1
+	local queue=$2
+
+	# Ignore the mlx5 async EQ irq
+	cat /proc/interrupts \
+		| grep $(basename $(realpath /sys/class/net/${dev}/device)) \
+		| grep -v mlx5_async \
+		| awk '/ '"${queue}"'/{ split($1, arr, ":"); print arr[1]; }'
+}
+
+__show_table() {
+	local dev=$1
+	for q in $(get_mellanox_queues ${dev}); do
+		for irq in $(get_mellanox_irqs_for_queue ${dev} ${q}); do
+			smp_affinity=$(cat /proc/irq/${irq}/smp_affinity_list)
+			printf "${q}\t${irq}\t${smp_affinity}\n"
+		done
+	done
+}
+
+show_table() {
+	local dev=$1
+	# Check if the device exists
+	if ! ip link show "$dev" > /dev/null 2>&1; then
+		echo "Device $dev not found."
+		exit 1
+	fi
+
+	NUM_QUEUES=$(ethtool -l "$dev" 2>/dev/null | awk '/Current/{ current = 1; } /Combined:*/ { if (current) { print $2 } }')
+	if ! [[ "$NUM_QUEUES" =~ ^[0-9]+$ ]]; then
+		echo "Unable to retrieve queue information for $dev."
+		exit 1
+	fi
+	echo "Device: $dev"
+	echo -e "\tInfo"
+	echo -e "\t\tNumber of Queues: $NUM_QUEUES"
+	echo -e "\t\tNuma: $(cat /sys/class/net/${dev}/device/numa_node)"
+	echo -e "\tQueue SMP Mapping:"
+	__show_table ${dev} | column -t -N "Queue,IRQ,SMP Affinity" -s $'\t' | awk '{printf "\t\t%s\n", $0 }'
+}
+
+if [[ -z ${1} ]]; then
+	echo -e "System Info:"
+	echo -e "\tNuma:"
+	NODE_CNT=$(ls /sys/devices/system/node/ | wc -l)
+	for node in $(ls /sys/devices/system/node/ | grep -E 'node[0-9]+'); do
+		echo -e "\t\t${node}: $(cat /sys/devices/system/node/${node}/cpulist)"
+	done
+	for dev in /sys/class/net/*; do
+		show_table $(basename ${dev})
+	done
+else
+	show_table ${1}
+fi 
