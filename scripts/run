@@ -107,24 +107,24 @@ need_vars() {
 
 need_vars
 
-do_suscp2() {
+do_scp() {
 	suscp2 -q --reason "network testing with kperf" $*
 }
 
-do_sush2() {
+do_ssh() {
 	local host=$1
 	shift
 
 	if [[ $# -eq 0 ]]; then
-		sush2 --reason 'network testing with kperf' -q -t root@${host} "$(cat)"
+		ssh -q -t root@${host} "$(cat)"
 	else
-		sush2 --reason 'network testing with kperf' -q -t root@${host} "$*"
+		ssh -q -t root@${host} "$*"
 	fi
 	return $?
 }
 
 query_ip() {
-	do_sush2 $1 ip -6 addr show dev $2 | grep global | grep -v deprecated | awk '{ print $2 }' | awk -F/ '{print $1}'
+	do_ssh $1 ip -6 addr show dev $2 | grep global | grep -v deprecated | awk '{ print $2 }' | awk -F/ '{print $1}'
 }
 
 __setup_flow_control() {
@@ -138,7 +138,7 @@ __setup_flow_control() {
 		local host=${SOURCE}
 	fi
 
-	do_sush2 ${host} <<-EOF
+	do_ssh ${host} <<-EOF
 		for nic in ${NICS[@]}; do
 			for irq in \$(ls /sys/class/net/\${nic}/device/msi_irqs); do
 				cat /sys/class/net/\${nic}/device/local_cpulist > /proc/irq/\${irq}/smp_affinity_list
@@ -148,7 +148,7 @@ __setup_flow_control() {
 
 	# kperf will pin CPUs to which ever core accepts the connection
 	# and so we want to spread these out accordingly using RSS.
-	do_sush2 ${host} <<-EOF
+	do_ssh ${host} <<-EOF
 		sysctl ${QUIET} net.core.optmem_max=8192000
 		for nic in ${NICS[@]}; do
 			# reset rss settings, to avoid getting hung up on existing indir tables
@@ -210,12 +210,12 @@ __add_routes() {
 	fi
 
 	if [[ "${host}" == ${DESTINATION} ]]; then
-		do_sush2 ${host} <<-EOF
+		do_ssh ${host} <<-EOF
 			ip -6 route del ${SRC_IPS[$src_nic]} dev ${dst_nic} src ${DST_IPS[$dst_nic]} 2>/dev/null || :
 			ip -6 route add ${SRC_IPS[$src_nic]} dev ${dst_nic} via ${via} src ${DST_IPS[$dst_nic]} ${PARAMS} pref $pref || :
 		EOF
 	else
-		do_sush2 ${host} <<-EOF
+		do_ssh ${host} <<-EOF
 			ip -6 route del ${DST_IPS[$dst_nic]} dev ${src_nic} src ${SRC_IPS[$src_nic]} 2>/dev/null || :
 			ip -6 route add ${DST_IPS[$dst_nic]} dev ${src_nic} via ${via} src ${SRC_IPS[$src_nic]} ${PARAMS} pref $pref || :
 		EOF
@@ -238,26 +238,33 @@ add_routes() {
 
 copy_kperf() {
 	log_info "Copying kperf to machines..."
-	do_suscp2 ./server root@${SOURCE}:/root/
-	log_info "Copied ./server to ${SOURCE}:/root/"
+	do_ssh ${SOURCE} mkdir -p /root/kperf/
+	do_scp ./server root@${SOURCE}:/root/kperf/server
+	log_info "Copied ./server to ${SOURCE}:/root/kperf/server"
 
-	do_suscp2 ./server root@${DESTINATION}:/root/
-	log_info "Copied ./server to ${DESTINATION}:/root/"
+	do_scp ./server root@${DESTINATION}:/root/kperf/server
+	log_info "Copied ./server to ${DESTINATION}:/root/kperf/server"
 
-	do_suscp2 ./client root@${SOURCE}:/root/
-	log_info "Copied ./client to ${SOURCE}:/root/"
+	do_scp ./client root@${SOURCE}:/root/kperf/client
+	log_info "Copied ./client to ${SOURCE}:/root/kperf/client"
 
 }
 
 kill_kperf_servers() {
-	do_sush2 ${SOURCE} 'LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/cuda-12.4/targets/x86_64-linux/lib ./server --kill --pid-file /tmp/kperf.src.pid'
-	do_sush2 ${DESTINATION} 'LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/cuda-12.4/targets/x86_64-linux/lib ./server --kill --pid-file /tmp/kperf.dst.pid'
+	do_ssh ${SOURCE} 'kill -9 `pgrep -f /root/kperf/server`'
+	do_ssh ${DESTINATION} 'kill -9 `pgrep -f /root/kperf/server`'
 }
 
 spawn_kperf_servers() {
 	echo "Spawning kperf servers..."
-	do_sush2 ${SOURCE} 'LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/cuda-12.4/targets/x86_64-linux/lib nohup ./server --verbose --pid-file /tmp/kperf.src.pid 2>&1 > ./kperf.src.log'
-	do_sush2 ${DESTINATION} 'LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/cuda-12.4/targets/x86_64-linux/lib nohup ./server --verbose --pid-file /tmp/kperf.dst.pid 2>&1 > ./kperf.dst.log'
+	do_ssh ${SOURCE} 'LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/cuda-12.4/targets/x86_64-linux/lib /root/kperf/server --verbose --no-daemon' 2>&1 | tee ./server.src.log >/dev/null &
+	do_ssh ${DESTINATION} 'LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/cuda-12.4/targets/x86_64-linux/lib /root/kperf/server --verbose --no-daemon' 2>&1 | tee ./server.dst.log >/dev/null &
+	echo "Spawning done"
+}
+
+wait_kperf_servers() {
+	# please don't judge
+	sleep 5
 }
 
 run_kperf_client() {
@@ -268,16 +275,10 @@ run_kperf_client() {
 	args="$args -n ${FLOWS}"
 	args="$args $*"
 
-	log_info "Starting kperf test..."
+	log_info "Starting kperf client..."
 	local COMMAND="./client --src ${SOURCE} --dst ${DESTINATION} $args"
 	echo "${SOURCE}: ${COMMAND}"
-	sush2 --reason "networking testing with kperf" root@${SOURCE} -- ${COMMAND}
-}
-
-numa_lookup() {
-	for node in /sys/devices/system/node/node*; do
-		echo
-	done
+	sush2 --reason "networking testing with kperf" root@${SOURCE} -- ${COMMAND} 2>&1 | tee ./kperf.client.log 1>/dev/null
 }
 
 set_nic_smp_affinity() {
@@ -286,7 +287,7 @@ set_nic_smp_affinity() {
 	local mode=$3
 
 	if [[ "${mode}" == 1to1 ]]; then
-		do_sush2 ${host} <<-EOF
+		do_ssh ${host} <<-EOF
 			cpulist=\$(cat /sys/class/net/${device}/device/local_cpulist)
 			segments=\$(echo \$cpulist | tr -cd ',' | wc -c)
 			segments=\$(( segments + 1 ))
@@ -317,7 +318,7 @@ set_nic_smp_affinity() {
 			done
 	EOF
 	elif [[ "${mode}"k != "spread" ]]; then
-		do_sush2 ${host} <<-EOF
+		do_ssh ${host} <<-EOF
 			for irq in \$(ls /sys/class/net/${device}/device/msi_irqs); do
 				cat /sys/class/net/${device}/device/local_cpulist > /proc/irq/\${irq}/smp_affinity_list
 			done
@@ -339,13 +340,13 @@ add_routes $DESTINATION
 echo "IP routes:"
 if (( ${LOG_LEVEL} >= ${DEBUG} )); then
 	for nic in ${SRC_NICS[@]}; do
-		do_sush2 $SOURCE ip addr show ${nic}
-		do_sush2 $SOURCE ip -6 route show dev ${nic}
+		do_ssh $SOURCE ip addr show ${nic}
+		do_ssh $SOURCE ip -6 route show dev ${nic}
 	done | awk -v host=${SOURCE} '{printf "%s:\t", host; print }'
 
 	for nic in ${DST_NICS[@]}; do
-		do_sush2 $DESTINATION ip addr show ${nic}
-		do_sush2 $DESTINATION ip -6 route show dev ${nic}
+		do_ssh $DESTINATION ip addr show ${nic}
+		do_ssh $DESTINATION ip -6 route show dev ${nic}
 	done | awk -v host=${DESTINATION} '{printf "%s:\t", host; print }'
 fi
 
@@ -360,7 +361,7 @@ done
 if (( ${LOG_LEVEL} >= ${DEBUG} )); then
 	TMP=$(mktemp)
 	echo "${SOURCE}: NIC Setup:"
-	do_sush2 ${SOURCE} > ${TMP} <<-EOF
+	do_ssh ${SOURCE} > ${TMP} <<-EOF
 		for nic in ${SRC_NICS[@]}; do
 			echo "NIC: \$nic"
 			ethtool -l \$nic
@@ -374,7 +375,7 @@ if (( ${LOG_LEVEL} >= ${DEBUG} )); then
 
 	> ${TMP}
 	echo "${DESTINATION}: NIC Setup:"
-	do_sush2 ${DESTINATION} > ${TMP} <<-EOF
+	do_ssh ${DESTINATION} > ${TMP} <<-EOF
 	for nic in ${DST_NICS[@]}; do
 			echo "NIC: \$nic"
 			ethtool -l \$nic | awk '{ printf '\t'; print }'
@@ -388,22 +389,25 @@ if (( ${LOG_LEVEL} >= ${DEBUG} )); then
 	rm ${TMP}
 fi
 
+cleanup() {
+	pkill -9 -P $$
+}
+trap cleanup EXIT
+
 kill_kperf_servers
 copy_kperf
 spawn_kperf_servers
-set -x
-echo "Spawned..."
-while ! do_sush2 ${DESTINATION} test -e /tmp/kperf.dst.pid; do
-	sleep 1
-done
-while ! do_sush2 ${SOURCE} test -e /tmp/kperf.src.pid; do
-	sleep 1
-done
+wait_kperf_servers
+
 run_kperf_client							\
 	${KPERF_CLIENT_ARGS}				\
-#	--devmem-rx									\
-#	--devmem-tx									\
+	--devmem-rx									\
+	--devmem-tx									\
 #	--devmem-tx-memory cuda			\
 #	--devmem-rx-memory cuda			\
 #	--devmem-src-dev auto				\
 #	--devmem-dst-dev auto				\
+#
+reset
+cat ./kperf.client.log
+exit 0
