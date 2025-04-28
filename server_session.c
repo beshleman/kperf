@@ -1058,7 +1058,8 @@ static void server_session_loop(int fd)
 		list_del(&conn->connections);
 		free(conn);
 	}
-	if (server_session_devmem_rx(&self, self.rx_mode))
+	if (server_session_devmem_rx(&self, self.rx_mode) ||
+	    server_session_devmem_tx(&self, self.tx_mode))
 		devmem_teardown(&self.devmem);
 }
 
