@@ -29,9 +29,22 @@
 
 #include "server.h"
 
+#ifdef USE_CUDA
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+#ifdef CU_MEM_RANGE_FLAG_DMA_BUF_MAPPING_TYPE_PCIE
+#define CUDA_FLAGS CU_MEM_RANGE_FLAG_DMA_BUF_MAPPING_TYPE_PCIE
+#else
+#define CUDA_FLAGS 0
+#endif
+#endif
+
 #define ROUND_UP(n, d) ((((n) + (d) - 1) / (d)) * (d))
 
 extern unsigned char patbuf[KPM_MAX_OP_CHUNK + PATTERN_PERIOD + 1];
+
+extern int verbose;
 
 static int ethtool(const char *ifname, void *data)
 {
@@ -503,6 +516,165 @@ static struct memory_provider udmabuf_memory_provider = {
 };
 
 static struct memory_provider *rxmp = &udmabuf_memory_provider;
+
+#ifdef USE_CUDA
+
+ /* Length of str: 'XXXX:XX:XX' */
+#define MAX_BUS_ID_LEN 11
+
+static int cuda_find_device(__u16 domain, __u8 bus, __u8 device)
+{
+	char bus_id[MAX_BUS_ID_LEN];
+	int devnum;
+	int ret;
+
+	ret = snprintf(bus_id, MAX_BUS_ID_LEN, "%hx:%hhx:%hhx", domain, bus, device);
+	if (ret < 0)
+		return -EINVAL;
+
+	ret = cudaDeviceGetByPCIBusId(&devnum, bus_id);
+	if (ret != cudaSuccess) {
+		warnx("No CUDA device found %s", bus_id);
+		return -EINVAL;
+	}
+
+	return devnum;
+}
+
+static int cuda_dev_init(struct pci_dev *dev)
+{
+	struct cudaDeviceProp deviceProp;
+	CUdevice cuda_dev;
+	int devnum;
+	int ret;
+	int ok;
+
+	ret = cuInit(0);
+	if (ret != CUDA_SUCCESS)
+		return -1;
+
+	/* If the user did not specify a device, select any device */
+	if (dev->domain == DEVICE_DOMAIN_ANY && dev->bus == DEVICE_BUS_ANY && dev->device == DEVICE_DEVICE_ANY) {
+		devnum = 0;
+	} else {
+		devnum = cuda_find_device(dev->domain, dev->bus, dev->device);
+		if (devnum < 0)
+			return -1;
+	}
+
+	ret = cuDeviceGet(&cuda_dev, devnum);
+	if (ret != CUDA_SUCCESS)
+		return -1;
+
+	ok = 0;
+	ret = cuDeviceGetAttribute(&ok, CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED,
+				   cuda_dev);
+	if (ret != CUDA_SUCCESS || !ok) {
+		if (!ok)
+			warnx("CUDA device does not support dmabuf");
+		return -1;
+	}
+
+	ret = cudaSetDevice(devnum);
+	if (ret != cudaSuccess) {
+		warn("cudaSetDevice() failed with error %d", ret);
+		return -1;
+	}
+
+	if (verbose >= 4)
+		fprintf(stderr, "cuda: tid %d selecting device %d (%s)\n",
+			getpid(), devnum, deviceProp.name);
+
+	return 0;
+}
+
+static struct memory_buffer *cuda_alloc(size_t size)
+{
+	struct memory_buffer *mem;
+	size_t page_size;
+	CUcontext ctx;
+	CUdevice dev;
+	int devnum;
+	int ret;
+
+	page_size = sysconf(_SC_PAGESIZE);
+	if (size % page_size) {
+		warnx("cuda memory size not aligned, size 0x%lx", size);
+		return NULL;
+	}
+
+	ret = cudaGetDevice(&devnum);
+	if (ret != cudaSuccess)
+		return NULL;
+
+	ret = cuDeviceGet(&dev, devnum);
+	if (ret != CUDA_SUCCESS)
+		return NULL;
+
+	ret = cuCtxCreate(&ctx, 0, dev);
+	if (ret != CUDA_SUCCESS)
+		return NULL;
+
+	mem = calloc(1, sizeof(*mem));
+	if (!mem)
+		goto destroy_ctx;
+
+	mem->size = size;
+
+	ret = cuMemAlloc((CUdeviceptr *)&mem->buf_mem, size);
+	if (ret != CUDA_SUCCESS)
+		goto free_mem;
+
+	ret = cuMemGetHandleForAddressRange((void *)&mem->fd, ((CUdeviceptr)mem->buf_mem),
+					    size, CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD,
+					    CUDA_FLAGS);
+	if (ret != CUDA_SUCCESS)
+		goto free_cuda;
+
+	mem->valid = true;
+
+	return mem;
+
+free_cuda:
+	if (cuMemFree((CUdeviceptr)mem->buf_mem) != CUDA_SUCCESS)
+		warnx("cuMemFree() failed");
+free_mem:
+	free(mem);
+destroy_ctx:
+	if (cuCtxDestroy(ctx) != CUDA_SUCCESS)
+		warnx("cuCtxDestroy() failed");
+
+	return NULL;
+}
+
+static void cuda_free(struct memory_buffer *mem)
+{
+	if (mem->valid) {
+		close(mem->fd);
+		close(mem->memfd);
+		close(mem->devfd);
+		munmap(mem->buf_mem, mem->size);
+		mem->valid = false;
+	}
+}
+
+int cuda_memcpy_to_device(struct memory_buffer *dst, size_t off,
+			   void *src, int n)
+{
+	int ret;
+
+	ret = cuMemcpyHtoD((CUdeviceptr)(dst->buf_mem + off), src, n);
+
+	return ret == CUDA_SUCCESS ? 0 : -1;
+}
+
+static struct memory_provider cuda_memory_provider = {
+	.dev_init = cuda_dev_init,
+	.alloc = cuda_alloc,
+	.free = cuda_free,
+	.memcpy_to_device = cuda_memcpy_to_device,
+};
+#endif
 
 /* Setup Devmem RX */
 int devmem_setup(struct session_state_devmem *devmem, int fd,
