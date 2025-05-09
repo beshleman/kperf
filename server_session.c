@@ -76,6 +76,15 @@ struct test {
 	struct list_node tests;
 };
 
+/*
+ * Returns true if a session is configured to be a devmem RX destination. Otherwise,
+ * returns false.
+ */
+static bool server_session_devmem_rx(struct session_state *self, enum kpm_rx_mode mode)
+{
+	return self->tcp_sock && (mode == KPM_RX_MODE_DEVMEM);
+}
+
 static struct connection *
 session_find_connection_by_id(struct session_state *self, unsigned int id)
 {
@@ -513,7 +522,7 @@ server_msg_mode(struct session_state *self, struct kpm_header *hdr)
 	}
 	req = (void *)hdr;
 
-	if (self->tcp_sock && req->rx_mode == KPM_RX_MODE_DEVMEM) {
+	if (server_session_devmem_rx(self, req->rx_mode)) {
 		ret = devmem_setup(&self->devmem, self->tcp_sock, req->dmabuf_size_mb,
 				   req->num_rx_queues, req->rx_provider,
 				   &req->dev);
@@ -1032,7 +1041,7 @@ static void server_session_loop(int fd)
 		list_del(&conn->connections);
 		free(conn);
 	}
-	if (self.tcp_sock && self.rx_mode == KPM_RX_MODE_DEVMEM)
+	if (server_session_devmem_rx(&self, self.rx_mode))
 		devmem_teardown(&self.devmem);
 }
 
