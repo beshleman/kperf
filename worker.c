@@ -72,7 +72,8 @@ struct connection {
 /* Returns true if worker is a devmem tx sender. Otherwise, returns false. */
 static bool worker_devmem_tx(struct worker_state *self)
 {
-	return self->tx_mode == KPM_TX_MODE_DEVMEM;
+	/* non-null means this worker is a devmem tx sender */
+	return self->devmem.tx_mem;
 }
 
 unsigned char patbuf[KPM_MAX_OP_CHUNK + PATTERN_PERIOD + 1];
