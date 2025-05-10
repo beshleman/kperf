@@ -69,6 +69,7 @@ struct connection_devmem {
 	/* ncdevmem uses 80k, allocate 64k for recvmsg tokens */
 	char ctrl_data[64 * 1024];
 	struct memory_buffer *mem;
+	struct memory_buffer *tx_mem;
 	struct ynl_sock *ys;
 };
 
@@ -76,22 +77,26 @@ struct session_state_devmem {
 	struct ynl_sock *ys;
 	char ifname[IFNAMSIZ];
 	struct memory_buffer *mem;
+	struct memory_buffer *tx_mem;
 	int rss_context;
 };
 
 struct worker_state_devmem {
 	struct memory_buffer *mem;
+	struct memory_buffer *tx_mem;
 };
 
 struct server_session *
 server_session_spawn(int fd, struct sockaddr_in6 *addr, socklen_t *addrlen);
 
 void NORETURN pworker_main(int fd, enum kpm_rx_mode rx_mode, enum kpm_tx_mode tx_mode,
-                           struct memory_buffer *devmem, bool validate);
+                           struct memory_buffer *devmem, bool validate,
+			   struct memory_buffer *tx_mem);
 
 int devmem_setup(struct session_state_devmem *devmem, int fd,
 		 size_t udmabuf_size, int num_queues,
 		 enum memory_provider_type provider, struct pci_dev *dev);
+int devmem_setup_tx(struct session_state_devmem *devmem, enum memory_provider_type provider, struct pci_dev *dev, size_t udmabuf_size);
 int devmem_teardown(struct session_state_devmem *devmem);
 int devmem_release_tokens(int fd, struct connection_devmem *conn);
 ssize_t devmem_recv(int fd, struct connection_devmem *conn,

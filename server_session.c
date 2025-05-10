@@ -543,6 +543,23 @@ server_msg_mode(struct session_state *self, struct kpm_header *hdr)
 		}
 	}
 
+	/*
+	 * Initialize the pattern before doing any TX setup. Some TX modes
+	 * (e.g., devmem) copy this pattern before fork(), so we need to initialize
+	 * now before TX mode-specific setup.
+	 */
+	patbuf_init();
+
+	if (server_session_devmem_tx(self, req->tx_mode)) {
+		ret = devmem_setup_tx(&self->devmem, req->tx_provider, &req->dev,
+				      req->udmabuf_size_mb);
+		if (ret < 0) {
+			warnx("Failed to setup devmem_tx");
+			self->quit = 1;
+			return;
+		}
+	}
+
 	self->rx_mode = req->rx_mode;
 	self->tx_mode = req->tx_mode;
 	self->validate = req->validate;
@@ -583,7 +600,7 @@ server_msg_spawn_pworker(struct session_state *self, struct kpm_header *hdr)
 	if (!pwrk->pid) {
 		close(p[0]);
 		pworker_main(p[1], self->rx_mode, self->tx_mode, self->devmem.mem,
-			     self->validate);
+			     self->validate, self->devmem.tx_mem);
 		exit(1);
 	}
 
@@ -752,9 +769,12 @@ bad_req:
 			 KPM_MSG_WORKER_TEST);
 		for (j = 0; j < msg->n_conns; j++) {
 			conn = session_find_connection_by_id(self, msg->specs[j].connection_id);
+
 			fdpass_send(pwrk->fd, conn->fd);
 			/* close to ensure the only open descriptors are owned by the worker. */
 			close(conn->fd);
+			if (server_session_devmem_tx(self, self->tx_mode))
+				fdpass_send(pwrk->fd, self->devmem.tx_mem->fd);
 		}
 	}
 

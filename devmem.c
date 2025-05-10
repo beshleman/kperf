@@ -40,9 +40,10 @@
 #endif
 #endif
 
-#define ROUND_UP(n, d) ((((n) + (d) - 1) / (d)) * (d))
-
 extern unsigned char patbuf[KPM_MAX_OP_CHUNK + PATTERN_PERIOD + 1];
+
+static struct memory_provider *rxmp;
+static struct memory_provider *txmp;
 
 extern int verbose;
 
@@ -515,9 +516,6 @@ static struct memory_provider udmabuf_memory_provider = {
 	.memcpy_to_device = udmabuf_memcpy_to_device,
 };
 
-static struct memory_provider *rxmp = &udmabuf_memory_provider;
-static struct memory_provider *txmp = &udmabuf_memory_provider;
-
 #ifdef USE_CUDA
 
  /* Length of str: 'XXXX:XX:XX' */
@@ -659,14 +657,14 @@ static void cuda_free(struct memory_buffer *mem)
 	}
 }
 
-int cuda_memcpy_to_device(struct memory_buffer *dst, size_t off,
+void cuda_memcpy_to_device(struct memory_buffer *dst, size_t off,
 			   void *src, int n)
 {
 	int ret;
 
 	ret = cuMemcpyHtoD((CUdeviceptr)(dst->buf_mem + off), src, n);
-
-	return ret == CUDA_SUCCESS ? 0 : -1;
+	if (ret != CUDA_SUCCESS)
+		warnx("cuMemcpyHtoD() failed");
 }
 
 static struct memory_provider cuda_memory_provider = {
@@ -690,6 +688,25 @@ static struct memory_provider *get_memory_provider(enum memory_provider_type pro
 		warn("invalid provider: %d", provider);
 		return NULL;
 	}
+}
+
+int devmem_setup_tx(struct session_state_devmem *devmem, enum memory_provider_type provider, struct pci_dev *dev, size_t udmabuf_size_mb)
+{
+	txmp = get_memory_provider(provider);
+	if (!txmp)
+		return -1;
+
+	if (txmp->dev_init && txmp->dev_init(dev) < 0)
+		return -1;
+
+	devmem->tx_mem = txmp->alloc(udmabuf_size_mb * 1024 * 1024);
+	if (!devmem->tx_mem) {
+		warnx("Failed to allocate devmem tx buffer");
+		return -1;
+	}
+
+	txmp->memcpy_to_device(devmem->tx_mem, 0, patbuf, sizeof(patbuf));
+	return 0;
 }
 
 /* Setup Devmem RX */
@@ -980,6 +997,12 @@ int devmem_sendmsg(int fd, struct connection_devmem *devmem, size_t off, size_t 
 	struct msghdr msg = { 0 };
 	struct cmsghdr *cmsg;
 	struct iovec iov;
+	int opt = 1;
+
+	if (setsockopt(fd, SOL_SOCKET, SO_ZEROCOPY, &opt, sizeof(opt))) {
+		warnx("failed to set SO_ZEROCOPY");
+		return -1;
+	}
 
 	iov.iov_base = (void *)off;
 	iov.iov_len = n;
@@ -994,7 +1017,7 @@ int devmem_sendmsg(int fd, struct connection_devmem *devmem, size_t off, size_t 
 	cmsg->cmsg_level = SOL_SOCKET;
 	cmsg->cmsg_type = SCM_DEVMEM_DMABUF;
 	cmsg->cmsg_len = CMSG_LEN(sizeof(int));
-	*((int *)CMSG_DATA(cmsg)) = devmem->mem->dmabuf_id;
+	*((int *)CMSG_DATA(cmsg)) = devmem->tx_mem->dmabuf_id;
 
 	return sendmsg(fd, &msg, MSG_SOCK_DEVMEM);
 }
@@ -1007,20 +1030,12 @@ int devmem_setup_conn(int fd, struct connection_devmem *devmem)
 	struct ynl_error yerr;
 	socklen_t optlen;
 	int ifindex;
-	int opt = 1;
 	int ret;
-
-	devmem->ys = ynl_sock_create(&ynl_netdev_family, &yerr);
-	if (!devmem->ys) {
-		warnx("Failed to setup YNL socket: %s", yerr.msg);
-		return -1;
-	}
 
 	optlen = sizeof(addr);
 	if (getsockname(fd, (struct sockaddr *)&addr, &optlen) < 0) {
 		warn("Failed to query socket address");
-		ret = -1;
-		goto sock_destroy;
+		return -1;
 	}
 
 	if (addr.sin6_family == AF_INET)
@@ -1029,42 +1044,31 @@ int devmem_setup_conn(int fd, struct connection_devmem *devmem)
 	ifindex = find_iface(&addr, ifname);
 	if (ifindex < 0) {
 		warnx("Failed to resolve ifindex: %s", strerror(-ifindex));
-		ret = -1;
-		goto sock_destroy;
+		return -1;
 	}
 
-	devmem->mem = txmp->alloc(ROUND_UP(sizeof(patbuf), 1024 * 1024));
-	if (!devmem->mem) {
-		warnx("Failed to allocate devmem tx buffer");
-		ret = -1;
-		goto sock_destroy;
+	devmem->ys = ynl_sock_create(&ynl_netdev_family, &yerr);
+
+	if (!devmem->ys) {
+		warnx("Failed to setup YNL socket: %s", yerr.msg);
+		return -1;
 	}
 
-	devmem->mem->dmabuf_id = bind_tx_queue(ifindex, devmem->mem->fd,
+	devmem->tx_mem->dmabuf_id = bind_tx_queue(ifindex, devmem->tx_mem->fd,
 					      devmem->ys);
-	if (devmem->mem->dmabuf_id < 0) {
+	if (devmem->tx_mem->dmabuf_id < 0) {
 		ret = -1;
-		goto free_udmabuf;
+		goto sock_destroy;
 	}
-
-	txmp->memcpy_to_device(devmem->mem, 0, patbuf, sizeof(patbuf));
 
 	if (setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, ifname, IFNAMSIZ)) {
 		warn("failed to bind device to socket");
 		ret = -1;
-		goto free_udmabuf;
-	}
-
-	if (setsockopt(fd, SOL_SOCKET, SO_ZEROCOPY, &opt, sizeof(opt))) {
-		warnx("failed to set SO_ZEROCOPY");
-		ret = -1;
-		goto free_udmabuf;
+		goto sock_destroy;
 	}
 
 	return 0;
 
-free_udmabuf:
-	txmp->free(devmem->mem);
 sock_destroy:
 	ynl_sock_destroy(devmem->ys);
 	devmem->ys = NULL;
@@ -1073,7 +1077,8 @@ sock_destroy:
 
 void devmem_teardown_conn(struct connection_devmem *devmem)
 {
-	txmp->free(devmem->mem);
+	if (txmp)
+		txmp->free(devmem->mem);
 	ynl_sock_destroy(devmem->ys);
 	devmem->ys = NULL;
 }
