@@ -282,9 +282,9 @@ worker_msg_test(struct worker_state *self, struct kpm_header *hdr)
 		conn->fd = fdpass_recv(self->main_sock);
 
 		if (worker_devmem_tx(self)) {
-			conn->devmem.tx_mem = self->devmem.tx_mem;
-			conn->devmem.tx_mem->fd = fdpass_recv(self->main_sock);
-			if (devmem_setup_conn(conn->fd, &conn->devmem) < 0) {
+			int mem_fd = fdpass_recv(self->main_sock);
+
+			if (devmem_setup_conn(conn->fd, &conn->devmem, mem_fd) < 0) {
 				self->quit = 1;
 				return;
 			}

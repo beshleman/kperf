@@ -68,8 +68,7 @@ struct connection_devmem {
 	int rxtok_len;
 	/* ncdevmem uses 80k, allocate 64k for recvmsg tokens */
 	char ctrl_data[64 * 1024];
-	struct memory_buffer *mem;
-	struct memory_buffer *tx_mem;
+	struct memory_buffer tx_mem;
 	struct ynl_sock *ys;
 };
 
@@ -103,7 +102,7 @@ ssize_t devmem_recv(int fd, struct connection_devmem *conn,
 		    unsigned char *rxbuf, size_t chunk, struct memory_buffer *mem,
 		    int rep, __u64 tot_recv, bool validate);
 int devmem_sendmsg(int fd, struct connection_devmem *devmem, size_t off, size_t n);
-int devmem_setup_conn(int fd, struct connection_devmem *devmem);
+int devmem_setup_conn(int fd, struct connection_devmem *devmem, int mem_fd);
 void devmem_teardown_conn(struct connection_devmem *devmem);
 
 void patbuf_init(void);

@@ -1017,13 +1017,13 @@ int devmem_sendmsg(int fd, struct connection_devmem *devmem, size_t off, size_t 
 	cmsg->cmsg_level = SOL_SOCKET;
 	cmsg->cmsg_type = SCM_DEVMEM_DMABUF;
 	cmsg->cmsg_len = CMSG_LEN(sizeof(int));
-	*((int *)CMSG_DATA(cmsg)) = devmem->tx_mem->dmabuf_id;
+	*((int *)CMSG_DATA(cmsg)) = devmem->tx_mem.dmabuf_id;
 
 	return sendmsg(fd, &msg, MSG_SOCK_DEVMEM);
 }
 
 /* Setup Devmem TX */
-int devmem_setup_conn(int fd, struct connection_devmem *devmem)
+int devmem_setup_conn(int fd, struct connection_devmem *devmem, int mem_fd)
 {
 	char ifname[IFNAMSIZ] = {};
 	struct sockaddr_in6 addr;
@@ -1054,9 +1054,10 @@ int devmem_setup_conn(int fd, struct connection_devmem *devmem)
 		return -1;
 	}
 
-	devmem->tx_mem->dmabuf_id = bind_tx_queue(ifindex, devmem->tx_mem->fd,
+	devmem->tx_mem.fd = mem_fd;
+	devmem->tx_mem.dmabuf_id = bind_tx_queue(ifindex, devmem->tx_mem.fd,
 					      devmem->ys);
-	if (devmem->tx_mem->dmabuf_id < 0) {
+	if (devmem->tx_mem.dmabuf_id < 0) {
 		ret = -1;
 		goto sock_destroy;
 	}
@@ -1078,7 +1079,7 @@ sock_destroy:
 void devmem_teardown_conn(struct connection_devmem *devmem)
 {
 	if (txmp)
-		txmp->free(devmem->mem);
+		txmp->free(&devmem->tx_mem);
 	ynl_sock_destroy(devmem->ys);
 	devmem->ys = NULL;
 }
