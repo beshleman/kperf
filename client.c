@@ -25,6 +25,8 @@ static struct {
 	bool msg_trunc;
 	bool devmem_rx;
 	bool devmem_tx;
+	char *devmem_rx_memory;
+	char *devmem_dst_dev;
 	bool msg_zerocopy;
 	bool tls;
 	bool tls_rx;
@@ -74,9 +76,17 @@ static struct {
 	/* 128M is enough to drive one queue at 200G */
 	.udmabuf_size_mb = 128,
 	.num_rx_queues = 1,
+	.devmem_rx_memory = "host",
+	.devmem_dst_dev = "any",
 };
 
 #define dbg(fmt...) while (0) { warnx(fmt); }
+
+#ifdef USE_CUDA
+static bool use_cuda = true;
+#else
+static bool use_cuda = false;
+#endif
 
 static void opt_show_uinthex(char buf[OPT_SHOW_LEN], const unsigned int *ui)
 {
@@ -149,12 +159,16 @@ static const struct opt_table opts[] = {
 	OPT_WITHOUT_ARG("--msg-zerocopy", opt_set_bool, &opt.msg_zerocopy, "Use MSG_ZEROCOPY on transmit"),
 	OPT_EARLY_WITHOUT_ARG("--devmem-rx", opt_set_bool, &opt.devmem_rx, "Use TCP Devmem on receive"),
 	OPT_WITHOUT_ARG("--devmem-tx", opt_set_bool, &opt.devmem_tx, "Use TCP Devmem on transmit"),
+	OPT_WITH_ARG("--devmem-rx-memory {cuda,host}", opt_set_charp, opt_show_charp,
+		     &opt.devmem_rx_memory, "Select the memory provider for TCP Devmem RX"),
 	OPT_WITH_ARG("--udmabuf-size-mb <arg>", opt_set_uintval, opt_show_uintval,
 		     &opt.udmabuf_size_mb, "Size of RX udmabuf for TCP Devmem mode"),
 	OPT_WITH_ARG("--num-rx-queues <arg>", opt_set_uintval, opt_show_uintval,
 		     &opt.num_rx_queues, "Number of RX queues for TCP Devmem mode"),
 	OPT_WITH_ARG("--validate <yes|no>", opt_set_bool_arg, NULL, &opt.validate,
 		     "Validate payload. Default is no when using --devmem-rx; otherwise, default is yes"),
+	OPT_WITH_ARG("--devmem-dst-dev <arg>", opt_set_charp, opt_show_charp,
+		     &opt.devmem_dst_dev, "Select the destination device for the TCP Devmem memory provider"),
 	OPT_ENDTABLE
 };
 
@@ -548,6 +562,7 @@ dump_result_machine(struct kpm_test_results *result, const char *dir,
 
 int main(int argc, char *argv[])
 {
+	enum memory_provider_type rx_provider;
 	enum kpm_rx_mode rx_mode = KPM_RX_MODE_SOCKET;
 	enum kpm_tx_mode tx_mode = KPM_TX_MODE_SOCKET;
 	unsigned int src_ncpus, dst_ncpus;
@@ -560,6 +575,7 @@ int main(int argc, char *argv[])
 	__u32 src_tst_id, dst_tst_id;
 	struct addrinfo *addr;
 	struct kpm_test *test;
+	struct pci_dev dst_dev;
 	unsigned int i;
 	socklen_t len;
 	int src, dst;
@@ -645,19 +661,46 @@ int main(int argc, char *argv[])
 	if (opt.msg_zerocopy && opt.devmem_tx)
 		errx(1, "--msg-zerocopy and --devmem-tx are mutually exclusive");
 
+	if (!strcmp(opt.devmem_rx_memory, "host")) {
+		rx_provider = MEMORY_PROVIDER_HOST;
+	} else if (!strcmp(opt.devmem_rx_memory, "cuda")) {
+		if (!use_cuda)
+			errx(1, "--devmem-rx-memory cuda selected, but kperf not compiled with CUDA support");
+
+		/* TODO: support --validate yes for cuda rx */
+		if (opt.validate)
+			errx(1, "--devmem-rx-memory cuda does not support --validate yes");
+
+		rx_provider = MEMORY_PROVIDER_CUDA;
+	} else {
+		errx(1, "--devmem-rx-memory arg invalid: %s", opt.devmem_rx_memory);
+	}
+
 	if (opt.msg_zerocopy)
 		tx_mode = KPM_TX_MODE_SOCKET_ZEROCOPY;
 	else if (opt.devmem_tx)
 		tx_mode = KPM_TX_MODE_DEVMEM;
 
+	if (!strcmp(opt.devmem_dst_dev, "any")) {
+		dst_dev.domain = DEVICE_DOMAIN_ANY;
+		dst_dev.bus = DEVICE_BUS_ANY;
+		dst_dev.device = DEVICE_DEVICE_ANY;
+	} else if (sscanf(opt.devmem_dst_dev, "%hx:%hhx:%hhx", &dst_dev.domain,
+			  &dst_dev.bus, &dst_dev.device) != 3) {
+		errx(1, "--devmem-dst-dev invalid PCI ID format. Expected format: domain:bus:device\n");
+		return -1;
+	}
+
 	if (kpm_req_mode(dst, rx_mode, tx_mode, opt.udmabuf_size_mb,
-			 opt.num_rx_queues, opt.validate) < 0) {
+			 opt.num_rx_queues, opt.validate,
+			 rx_provider, &dst_dev) < 0) {
 		warnx("Failed setup destination mode");
 		goto out;
 	}
 
-	if (kpm_req_mode(src, rx_mode, tx_mode, opt.udmabuf_size_mb, opt.num_rx_queues,
-			 opt.validate) < 0) {
+	if (kpm_req_mode(src, rx_mode, tx_mode, opt.udmabuf_size_mb,
+			 opt.num_rx_queues, opt.validate,
+			 rx_provider, &dst_dev) < 0) {
 		warnx("Failed setup source mode");
 		goto out;
 	}

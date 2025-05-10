@@ -516,6 +516,7 @@ static struct memory_provider udmabuf_memory_provider = {
 };
 
 static struct memory_provider *rxmp = &udmabuf_memory_provider;
+static struct memory_provider *txmp = &udmabuf_memory_provider;
 
 #ifdef USE_CUDA
 
@@ -676,9 +677,26 @@ static struct memory_provider cuda_memory_provider = {
 };
 #endif
 
+static struct memory_provider *get_memory_provider(enum memory_provider_type provider)
+{
+	switch (provider) {
+	case MEMORY_PROVIDER_HOST:
+		return &udmabuf_memory_provider;
+#ifdef USE_CUDA
+	case MEMORY_PROVIDER_CUDA:
+		return &cuda_memory_provider;
+#endif
+	default:
+		warn("invalid provider: %d", provider);
+		return NULL;
+	}
+}
+
 /* Setup Devmem RX */
 int devmem_setup(struct session_state_devmem *devmem, int fd,
-		 size_t udmabuf_size_mb, int num_queues)
+		 size_t udmabuf_size_mb, int num_queues,
+		 enum memory_provider_type provider,
+		 struct pci_dev *dev)
 {
 	struct netdev_queue_id *queues;
 	char ifname[IFNAMSIZ] = {};
@@ -700,6 +718,10 @@ int devmem_setup(struct session_state_devmem *devmem, int fd,
 		warn("Failed to query socket address");
 		return -1;
 	}
+
+	rxmp = get_memory_provider(provider);
+	if (!rxmp)
+		return -1;
 
 	if (addr.sin6_family == AF_INET)
 		inet_to_inet6((void *)&addr, &addr);
@@ -723,9 +745,14 @@ int devmem_setup(struct session_state_devmem *devmem, int fd,
 		goto sock_destroy;
 	}
 
+	if (rxmp->dev_init && rxmp->dev_init(dev) < 0) {
+		ret = -1;
+		goto sock_destroy;
+	}
+
 	devmem->mem = rxmp->alloc(udmabuf_size_mb * 1024 * 1024);
 	if (!devmem->mem) {
-		warnx("Failed to allocate udmabuf");
+		warnx("Failed to allocate memory");
 		ret = -1;
 		goto sock_destroy;
 	}
@@ -734,7 +761,7 @@ int devmem_setup(struct session_state_devmem *devmem, int fd,
 		warnx("Invalid number of RX queues (%u) requested (max: %u)",
 		      num_queues, rxqn - 1);
 		ret = -1;
-		goto free_udmabuf;
+		goto free_memory;
 	}
 
 	max_kernel_queue = rxqn - num_queues;
@@ -743,7 +770,7 @@ int devmem_setup(struct session_state_devmem *devmem, int fd,
 	if (rss_equal(ifname, max_kernel_queue)) {
 		warnx("Failed to setup RSS");
 		ret = -1;
-		goto free_udmabuf;
+		goto free_memory;
 	}
 
 	memcpy(devmem->ifname, ifname, IFNAMSIZ);
@@ -784,7 +811,7 @@ undo_rss_context:
 	rss_context_delete(devmem);
 undo_rss:
 	rss_equal(ifname, rxqn);
-free_udmabuf:
+free_memory:
 	rxmp->free(devmem->mem);
 sock_destroy:
 	ynl_sock_destroy(devmem->ys);
@@ -808,7 +835,8 @@ int devmem_teardown(struct session_state_devmem *devmem)
 	}
 	if (devmem->ys)
 		ynl_sock_destroy(devmem->ys);
-	rxmp->free(devmem->mem);
+	if (rxmp)
+		rxmp->free(devmem->mem);
 	return 0;
 }
 
@@ -850,6 +878,7 @@ static int devmem_validate_token(struct memory_buffer *mem,
 	ioctl(mem->fd, DMA_BUF_IOCTL_SYNC, &sync);
 
 	pat = &patbuf[start];
+	/* TODO: memory_provider for CUDA case? */
 	ret = memcmp(pat, mem->buf_mem + dmabuf_cmsg->frag_offset, dmabuf_cmsg->frag_size);
 
 	sync.flags = DMA_BUF_SYNC_END;
@@ -1004,7 +1033,7 @@ int devmem_setup_conn(int fd, struct connection_devmem *devmem)
 		goto sock_destroy;
 	}
 
-	devmem->mem = rxmp->alloc(ROUND_UP(sizeof(patbuf), 1024 * 1024));
+	devmem->mem = txmp->alloc(ROUND_UP(sizeof(patbuf), 1024 * 1024));
 	if (!devmem->mem) {
 		warnx("Failed to allocate devmem tx buffer");
 		ret = -1;
@@ -1018,7 +1047,7 @@ int devmem_setup_conn(int fd, struct connection_devmem *devmem)
 		goto free_udmabuf;
 	}
 
-	rxmp->memcpy_to_device(devmem->mem, 0, patbuf, sizeof(patbuf));
+	txmp->memcpy_to_device(devmem->mem, 0, patbuf, sizeof(patbuf));
 
 	if (setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, ifname, IFNAMSIZ)) {
 		warn("failed to bind device to socket");
@@ -1035,7 +1064,7 @@ int devmem_setup_conn(int fd, struct connection_devmem *devmem)
 	return 0;
 
 free_udmabuf:
-	rxmp->free(devmem->mem);
+	txmp->free(devmem->mem);
 sock_destroy:
 	ynl_sock_destroy(devmem->ys);
 	devmem->ys = NULL;
@@ -1044,7 +1073,7 @@ sock_destroy:
 
 void devmem_teardown_conn(struct connection_devmem *devmem)
 {
-	rxmp->free(devmem->mem);
+	txmp->free(devmem->mem);
 	ynl_sock_destroy(devmem->ys);
 	devmem->ys = NULL;
 }
