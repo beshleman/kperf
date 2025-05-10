@@ -75,6 +75,18 @@ struct test {
 };
 
 /*
+ * Returns true if a session is configured to be a devmem TX source. Otherwise,
+ * returns false.
+ *
+ * This function is unable to use self->devmem.tx_mem state because it must
+ * support being called before tx_mem is allocated.
+ */
+static bool server_session_devmem_tx(struct session_state *self, enum kpm_tx_mode mode)
+{
+	return !self->tcp_sock && (mode == KPM_TX_MODE_DEVMEM);
+}
+
+/*
  * Returns true if a session is configured to be a devmem RX destination. Otherwise,
  * returns false.
  */
