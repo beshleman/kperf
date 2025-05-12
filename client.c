@@ -25,6 +25,8 @@ static struct {
 	bool msg_trunc;
 	bool devmem_rx;
 	char *devmem_rx_memory;
+	char *devmem_tx_memory;
+	char *devmem_src_dev;
 	char *devmem_dst_dev;
 	bool devmem_tx;
 	bool msg_zerocopy;
@@ -77,6 +79,8 @@ static struct {
 	.udmabuf_size_mb = 128,
 	.num_rx_queues = 1,
 	.devmem_rx_memory = "host",
+	.devmem_tx_memory = "host",
+	.devmem_src_dev = "any",
 	.devmem_dst_dev = "any",
 };
 
@@ -161,12 +165,16 @@ static const struct opt_table opts[] = {
 	OPT_WITH_ARG("--devmem-rx-memory {cuda,host}", opt_set_charp, opt_show_charp,
 		     &opt.devmem_rx_memory, "Select the memory provider for TCP Devmem RX"),
 	OPT_WITHOUT_ARG("--devmem-tx", opt_set_bool, &opt.devmem_tx, "Use TCP Devmem on transmit"),
+	OPT_WITH_ARG("--devmem-tx-memory {cuda,host}", opt_set_charp, opt_show_charp,
+		     &opt.devmem_tx_memory, "Select the memory provider for TCP Devmem TX"),
 	OPT_WITH_ARG("--udmabuf-size-mb <arg>", opt_set_uintval, opt_show_uintval,
 		     &opt.udmabuf_size_mb, "Size of RX udmabuf for TCP Devmem mode"),
 	OPT_WITH_ARG("--num-rx-queues <arg>", opt_set_uintval, opt_show_uintval,
 		     &opt.num_rx_queues, "Number of RX queues for TCP Devmem mode"),
 	OPT_WITH_ARG("--validate <yes|no>", opt_set_bool_arg, NULL, &opt.validate,
 		     "Validate payload. Default is no when using --devmem-rx; otherwise, default is yes"),
+	OPT_WITH_ARG("--devmem-src-dev <arg>", opt_set_charp, opt_show_charp,
+		     &opt.devmem_src_dev, "Select the source device for the TCP Devmem memory provider"),
 	OPT_WITH_ARG("--devmem-dst-dev <arg>", opt_set_charp, opt_show_charp,
 		     &opt.devmem_dst_dev, "Select the destination device for the TCP Devmem memory provider"),
 	OPT_ENDTABLE
@@ -562,7 +570,7 @@ dump_result_machine(struct kpm_test_results *result, const char *dir,
 
 int main(int argc, char *argv[])
 {
-	enum memory_provider_type rx_provider;
+	enum memory_provider_type rx_provider, tx_provider;
 	enum kpm_rx_mode rx_mode = KPM_RX_MODE_SOCKET;
 	enum kpm_tx_mode tx_mode = KPM_TX_MODE_SOCKET;
 	unsigned int src_ncpus, dst_ncpus;
@@ -576,6 +584,7 @@ int main(int argc, char *argv[])
 	struct addrinfo *addr;
 	struct kpm_test *test;
 	struct pci_dev dst_dev;
+	struct pci_dev src_dev;
 	unsigned int i;
 	socklen_t len;
 	int src, dst;
@@ -658,6 +667,19 @@ int main(int argc, char *argv[])
 	else if (opt.devmem_rx)
 		rx_mode = KPM_RX_MODE_DEVMEM;
 
+	if (opt.msg_zerocopy && opt.devmem_tx)
+		errx(1, "--msg-zerocopy and --devmem-tx are mutually exclusive");
+
+	if (!strcmp(opt.devmem_tx_memory, "host")) {
+		tx_provider = MEMORY_PROVIDER_HOST;
+	} else if (!strcmp(opt.devmem_tx_memory, "cuda")) {
+		if (!use_cuda)
+			errx(1, "--devmem-tx-memory cuda selected, but kperf not compiled with CUDA support");
+		tx_provider = MEMORY_PROVIDER_CUDA;
+	} else {
+		errx(1, "--devmem-tx-memory arg invalid: %s", opt.devmem_tx_memory);
+	}
+
 	if (!strcmp(opt.devmem_rx_memory, "host")) {
 		rx_provider = MEMORY_PROVIDER_HOST;
 	} else if (!strcmp(opt.devmem_rx_memory, "cuda")) {
@@ -687,20 +709,30 @@ int main(int argc, char *argv[])
 		dst_dev.device = DEVICE_DEVICE_ANY;
 	} else if (sscanf(opt.devmem_dst_dev, "%hx:%hhx:%hhx", &dst_dev.domain,
 			  &dst_dev.bus, &dst_dev.device) != 3) {
+		errx(1, "--devmem-src-dev invalid PCI ID format. Expected format: domain:bus:device\n");
+		return -1;
+	}
+
+	if (!strcmp(opt.devmem_src_dev, "any")) {
+		src_dev.domain = DEVICE_DOMAIN_ANY;
+		src_dev.bus = DEVICE_BUS_ANY;
+		src_dev.device = DEVICE_DEVICE_ANY;
+	} else if (sscanf(opt.devmem_src_dev, "%hx:%hhx:%hhx", &src_dev.domain,
+			  &src_dev.bus, &src_dev.device) != 3) {
 		errx(1, "--devmem-dst-dev invalid PCI ID format. Expected format: domain:bus:device\n");
 		return -1;
 	}
 
 	if (kpm_req_mode(dst, rx_mode, tx_mode, opt.udmabuf_size_mb,
 			 opt.num_rx_queues, opt.validate,
-			 rx_provider, &dst_dev) < 0) {
+			 rx_provider, tx_provider, &dst_dev) < 0) {
 		warnx("Failed setup destination mode");
 		goto out;
 	}
 
 	if (kpm_req_mode(src, rx_mode, tx_mode, opt.udmabuf_size_mb,
 			 opt.num_rx_queues, opt.validate,
-			 rx_provider, &dst_dev) < 0) {
+			 rx_provider, tx_provider, &src_dev) < 0) {
 		warnx("Failed setup source mode");
 		goto out;
 	}

@@ -69,10 +69,14 @@ struct connection {
 	struct list_node connections;
 };
 
-/* Returns true if worker is a devmem tx sender. Otherwise, returns false. */
+/* Returns true if both the server session is configured for
+ * KPM_TX_MODE_DEVMEM and this worker is a source. Otherwise, false.
+ *
+ * Should be derived from server_session_devmem_tx().
+ */
 static bool worker_devmem_tx(struct worker_state *self)
 {
-	return self->tx_mode == KPM_TX_MODE_DEVMEM;
+	return self->devmem.use_tx;
 }
 
 unsigned char patbuf[KPM_MAX_OP_CHUNK + PATTERN_PERIOD + 1];
@@ -280,6 +284,16 @@ worker_msg_test(struct worker_state *self, struct kpm_header *hdr)
 		conn->id = req->specs[i].connection_id;
 		conn->fd = fdpass_recv(self->main_sock);
 
+		/* Only devmem TX sessions/workers have a dmabuf fd to pass */
+		if (worker_devmem_tx(self)) {
+			int dmabuf_fd = fdpass_recv(self->main_sock);
+
+			if (devmem_setup_conn(conn->fd, &conn->devmem, dmabuf_fd) < 0) {
+				self->quit = 1;
+				return;
+			}
+		}
+
 		info_len = sizeof(conn->init_info);
 		if (getsockopt(conn->fd, IPPROTO_TCP, TCP_INFO,
 			       (void *)&conn->init_info, &info_len) < 0) {
@@ -337,13 +351,6 @@ worker_msg_test(struct worker_state *self, struct kpm_header *hdr)
 			warnx("Failed to set SO_ZEROCOPY");
 			self->quit = 1;
 			return;
-		}
-
-		if (worker_devmem_tx(self)) {
-			if (devmem_setup_conn(conn->fd, &conn->devmem) < 0) {
-				self->quit = 1;
-				return;
-			}
 		}
 
 		ev.events = EPOLLIN | EPOLLOUT;
@@ -759,14 +766,14 @@ void patbuf_init(void)
 /* == Main loop == */
 
 void NORETURN pworker_main(int fd, enum kpm_rx_mode rx_mode, enum kpm_tx_mode tx_mode,
-			   struct memory_buffer *devmem, bool validate)
+			   struct memory_buffer *devmem, bool validate, bool use_devmem_tx)
 {
 	struct worker_state self = {
 		.main_sock = fd,
 		.rx_mode = rx_mode,
 		.tx_mode = tx_mode,
 		.validate = validate,
-		.devmem = { .mem = devmem },
+		.devmem = { .mem = devmem, .use_tx = use_devmem_tx },
 	};
 	struct epoll_event ev, events[32];
 	int i, nfds;
