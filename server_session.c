@@ -141,6 +141,16 @@ static int session_prepare_conn(struct session_state *self, struct connection *c
 	return ret;
 }
 
+static int session_prepare_test(struct session_state *self)
+{
+	int ret = 0;
+
+	if (server_session_devmem_rx(self, self->rx_mode))
+		ret = devmem_prepare_test(&self->devmem);
+
+	return ret;
+}
+
 static void session_new_conn(struct session_state *self, int fd)
 {
 	struct connection *conn;
@@ -760,6 +770,8 @@ bad_req:
 		if (session_prepare_conn(self, conn) < 0)
 			warnx("failed to prepare connection");
 	}
+
+	session_prepare_test(self);
 
 	for (i = 0; i < test->worker_range; i++) {
 		struct connection *conn;

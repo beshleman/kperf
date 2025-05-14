@@ -66,21 +66,6 @@ static int ethtool(const char *ifname, void *data)
 	return ret;
 }
 
-static int devmem_del_rule(struct session_state_devmem *devmem, __u32 rule)
-{
-	struct ethtool_rxnfc del;
-
-	del.cmd = ETHTOOL_SRXCLSRLDEL;
-	del.fs.location = rule;
-
-	if (ethtool(devmem->ifname, &del) < 0) {
-		warn("failed to remove rx steering rule %u", rule);
-		return -1;
-	}
-
-	return 0;
-}
-
 static void reset_flow_steering(const char *ifname)
 {
 	struct ethtool_rxnfc cnt = {};
@@ -894,6 +879,29 @@ int devmem_setup_rx_socket(struct session_state_devmem *devmem, int fd)
 	}
 
 	return 0;
+}
+
+static int devmem_del_rule(struct session_state_devmem *devmem, __u32 rule)
+{
+	struct ethtool_rxnfc del;
+
+	del.cmd = ETHTOOL_SRXCLSRLDEL;
+	del.fs.location = rule;
+
+	if (ethtool(devmem->ifname, &del) < 0) {
+		warn("failed to remove rx steering rule %u", rule);
+		return -1;
+	}
+
+	return 0;
+}
+
+int devmem_prepare_test(struct session_state_devmem *devmem)
+{
+	/* Drop the RSS context rule to make sure the per-conn
+	 * rules take precedence.
+	 */
+	return devmem_del_rule(devmem, RSS_CONTEXT_RULE);
 }
 
 int devmem_teardown(struct session_state_devmem *devmem)

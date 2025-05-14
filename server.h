@@ -109,5 +109,6 @@ void devmem_teardown_conn(struct connection_devmem *devmem);
 
 void patbuf_init(void);
 int devmem_setup_rx_socket(struct session_state_devmem *devmem, int fd);
+int devmem_prepare_test(struct session_state_devmem *devmem);
 
 #endif /* SERVER_H */
