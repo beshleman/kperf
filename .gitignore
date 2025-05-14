@@ -4,3 +4,4 @@ bipartite_match
 client
 cpu_stat
 server
+affinity
