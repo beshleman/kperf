@@ -17,13 +17,13 @@ endif
 include $(wildcard *.d)
 
 all: server client units
-units: bipartite_match cpu_stat
+units: bipartite_match cpu_stat affinity
 
 ifdef USE_CUDA
 server: LIBS += -lcuda -lcudart -L/usr/local/cuda/lib64
 endif
 
-server: $(CCAN_PATH)/libccan.a $(YNL_PATH)/libynl.a server.o server_session.o proto.o worker.o devmem.o cpu_stat.o tcp.o
+server: $(CCAN_PATH)/libccan.a $(YNL_PATH)/libynl.a server.o server_session.o proto.o worker.o devmem.o cpu_stat.o tcp.o affinity.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
 
 client: $(CCAN_PATH)/libccan.a client.o proto.o bipartite_match.o
@@ -37,7 +37,7 @@ $(YNL_PATH)/libynl.a:
 	make -C $(YNL_PATH)
 
 clean:
-	rm -rf *.o *.d *~ bipartite_match cpu_stat
+	rm -rf *.o *.d *~ bipartite_match cpu_stat affinity
 
 distclean:
 	rm -rf *.o *.d *~ bipartite_match cpu_stat server client $(CCAN_PATH)/libccan.a
@@ -47,6 +47,9 @@ bipartite_match: $(CCAN_PATH)/libccan.a
 
 cpu_stat: $(CCAN_PATH)/libccan.a
 	$(CC) $(CFLAGS) -DKPERF_UNITS cpu_stat.c -o cpu_stat $(CCAN_PATH)/libccan.a
+
+affinity:
+	$(CC) $(CFLAGS) -DKPERF_UNITS affinity.c -o affinity
 
 %.o: %.c
 	$(COMPILE.c) -MMD -o $@ $<

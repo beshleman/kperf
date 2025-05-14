@@ -67,7 +67,7 @@ int get_numa_node(const char *interface)
 	return numa_node;
 }
 
-int server_counter_file_init(const char *filename)
+int affinity_db_init(const char *filename)
 {
 	unsigned char buf[MAX_CPUS] = {0};
 	FILE *file;
@@ -88,7 +88,7 @@ int server_counter_file_init(const char *filename)
 }
 
 /* Return true if we acquire the cpu. Otherwise, return false */
-bool server_counter_file_get_cpu(const char *filename, int cpu)
+bool affinity_db_get_cpu(const char *filename, int cpu)
 {
 	unsigned char value;
 	bool ret = false;
@@ -151,7 +151,7 @@ bool server_counter_file_get_cpu(const char *filename, int cpu)
 	return ret;
 }
 
-bool server_counter_file_free_cpu(const char *filename, int cpu)
+bool affinity_db_free_cpu(const char *filename, int cpu)
 {
 	unsigned char value;
 	bool ret = false;
@@ -272,16 +272,13 @@ out:
 	return ret;
 }
 
-int next_cpu(const char *ifname)
+int affinity_next_cpu(const char *ifname)
 {
-	char counter_fpath[PATH_MAX];
 	char path[PATH_MAX];
-	int index, cpu;
 	char buf[128];
 	cpu_set_t set;
-	int count;
-	int per_node;
 	int numa;
+	int cpu;
 	int fd;
 	int i;
 
@@ -310,7 +307,7 @@ int next_cpu(const char *ifname)
 		return -1;
 	}
 
-	server_counter_file_init(SERVER_CPUS_FPATH);
+	affinity_db_init(SERVER_CPUS_FPATH);
 
 	/* return the nth CPU from the set */
 	cpu = -1;
@@ -318,7 +315,7 @@ int next_cpu(const char *ifname)
 		if (!CPU_ISSET(i, &set))
 			continue;
 
-		if (server_counter_file_get_cpu(SERVER_CPUS_FPATH, i)) {
+		if (affinity_db_get_cpu(SERVER_CPUS_FPATH, i)) {
 			cpu = i;
 			break;
 		}
@@ -327,9 +324,9 @@ int next_cpu(const char *ifname)
 	return cpu;
 }
 
-void free_cpu(const char *filename, int cpu)
+void affinity_free_cpu(const char *filename, int cpu)
 {
-	if (!server_counter_file_free_cpu(SERVER_CPUS_FPATH, cpu))
+	if (!affinity_db_free_cpu(SERVER_CPUS_FPATH, cpu))
 		fprintf(stderr, "failed to free cpu %d\n", cpu);
 }
 
@@ -351,7 +348,7 @@ void test_parse_cpu_mask(void)
 }
 #endif
 
-#ifdef KPERF_UNIT
+#ifdef KPERF_UNITS
 int main(int argc, char **argv)
 {
 	bool cpus[MAX_CPUS] = {false};
@@ -361,7 +358,7 @@ int main(int argc, char **argv)
 
 	printf("Acquire all CPUs local to %s\n", argv[1]);
 	next = 0;
-	while ((next = next_cpu(argv[1])) >= 0) {
+	while ((next = affinity_next_cpu(argv[1])) >= 0) {
 		printf("%d,", next);
 		cpus[next] = 1;
 	}
@@ -371,21 +368,21 @@ int main(int argc, char **argv)
 	for (i = 0; i < MAX_CPUS; i++) {
 		if (!cpus[i])
 			continue;
-		free_cpu(argv[1], i);
+		affinity_free_cpu(argv[1], i);
 	}
 
 	printf("Acquire first cpu, free, then acquire again\n");
-	next = next_cpu(argv[1]);
+	next = affinity_next_cpu(argv[1]);
 	printf("\tacquired cpu %d, freeing it immediately\n", next);
 	expected = next;
-	free_cpu(argv[1], next);
+	affinity_free_cpu(argv[1], next);
 
-	next = next_cpu(argv[1]);
+	next = affinity_next_cpu(argv[1]);
 	if (next != expected)
 		fprintf(stderr, "failed: the next cpu %d was not the expected %d\n", next, expected);
 	else
 		printf("OK: next cpu was as expected\n");
-	free_cpu(argv[1], next);
+	affinity_free_cpu(argv[1], next);
 
 
 	return 0;
