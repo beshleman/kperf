@@ -111,4 +111,7 @@ void patbuf_init(void);
 int devmem_setup_rx_socket(struct session_state_devmem *devmem, int fd);
 int devmem_prepare_test(struct session_state_devmem *devmem);
 
+int affinity_next_cpu(const char *ifname);
+void affinity_free_cpu(int cpu);
+
 #endif /* SERVER_H */
