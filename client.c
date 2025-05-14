@@ -368,7 +368,7 @@ show_cpu_stat(const char *pfx, struct kpm_test_results *result, unsigned int id)
 		return;
 	}
 
-	warnx("  %sCPU%3d: usr:%5.2f%% sys:%5.2f%% idle:%5.2f%% iow:%5.2f%% irq:%5.2f%% sirq:%5.2f%%",
+	warnx("  %sCPU%4d: usr:%5.2f%% sys:%5.2f%% idle:%5.2f%% iow:%5.2f%% irq:%5.2f%% sirq:%5.2f%%",
 	      pfx, id, cpu->user / 100.0, cpu->system / 100.0,
 	      cpu->idle / 100.0, cpu->iowait / 100.0, cpu->irq / 100.0,
 	      cpu->sirq / 100.0);
