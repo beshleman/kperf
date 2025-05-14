@@ -78,6 +78,7 @@ struct session_state_devmem {
 	struct memory_buffer *mem;
 	struct memory_buffer *tx_mem;
 	int rss_context;
+	int queue_alloc;
 };
 
 struct worker_state_devmem {
@@ -107,5 +108,6 @@ int devmem_setup_conn(int fd, struct connection_devmem *devmem, int dmabuf_fd);
 void devmem_teardown_conn(struct connection_devmem *devmem);
 
 void patbuf_init(void);
+int devmem_setup_rx_socket(struct session_state_devmem *devmem, int fd);
 
 #endif /* SERVER_H */

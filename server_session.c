@@ -131,6 +131,16 @@ session_find_test_by_id(struct session_state *self, unsigned int id)
 	return NULL;
 }
 
+static int session_prepare_conn(struct session_state *self, struct connection *conn)
+{
+	int ret = 0;
+
+	if (server_session_devmem_rx(self, self->rx_mode))
+		ret = devmem_setup_rx_socket(&self->devmem, conn->fd);
+
+	return ret;
+}
+
 static void session_new_conn(struct session_state *self, int fd)
 {
 	struct connection *conn;
@@ -746,6 +756,9 @@ bad_req:
 
 		msg = fwd[t->worker_id - min_wrk];
 		memcpy(&msg->specs[msg->n_conns++], t, sizeof(*t));
+
+		if (session_prepare_conn(self, conn) < 0)
+			warnx("failed to prepare connection");
 	}
 
 	for (i = 0; i < test->worker_range; i++) {

@@ -40,6 +40,8 @@
 #endif
 #endif
 
+#define RSS_CONTEXT_RULE 0
+
 extern unsigned char patbuf[KPM_MAX_OP_CHUNK + PATTERN_PERIOD + 1];
 
 static struct memory_provider *rxmp;
@@ -62,6 +64,21 @@ static int ethtool(const char *ifname, void *data)
 	ret = ioctl(fd, SIOCETHTOOL, &ifr);
 	close(fd);
 	return ret;
+}
+
+static int devmem_del_rule(struct session_state_devmem *devmem, __u32 rule)
+{
+	struct ethtool_rxnfc del;
+
+	del.cmd = ETHTOOL_SRXCLSRLDEL;
+	del.fs.location = rule;
+
+	if (ethtool(devmem->ifname, &del) < 0) {
+		warn("failed to remove rx steering rule %u", rule);
+		return -1;
+	}
+
+	return 0;
 }
 
 static void reset_flow_steering(const char *ifname)
@@ -96,12 +113,13 @@ free_rules:
 }
 
 static int add_steering_rule(struct sockaddr_in6 *server_sin,
-			     const char *ifname, int rss_context)
+			     const char *ifname, int rss_context,
+			     int queue, int idx, bool addr_is_dest)
 {
 	struct ethtool_rxnfc add = {};
 
 	add.cmd = ETHTOOL_SRXCLSRLINS;
-	add.rss_context = rss_context;
+	add.fs.location = idx;
 
 	if (IN6_IS_ADDR_V4MAPPED(&server_sin->sin6_addr)) {
 		add.fs.flow_type = TCP_V4_FLOW;
@@ -114,19 +132,34 @@ static int add_steering_rule(struct sockaddr_in6 *server_sin,
 		add.fs.m_u.tcp_ip4_spec.pdst = 0xffff;
 	} else {
 		add.fs.flow_type = TCP_V6_FLOW;
-                memcpy(add.fs.h_u.tcp_ip6_spec.ip6dst, &server_sin->sin6_addr,
-                       16);
-                memcpy(&add.fs.h_u.tcp_ip6_spec.pdst, &server_sin->sin6_port,
-                       2);
 
-                add.fs.m_u.tcp_ip6_spec.ip6dst[0] = 0xffffffff;
-		add.fs.m_u.tcp_ip6_spec.ip6dst[1] = 0xffffffff;
-		add.fs.m_u.tcp_ip6_spec.ip6dst[2] = 0xffffffff;
-		add.fs.m_u.tcp_ip6_spec.ip6dst[3] = 0xffffffff;
-		add.fs.m_u.tcp_ip6_spec.pdst = 0xffff;
+		if (addr_is_dest) {
+			memcpy(add.fs.h_u.tcp_ip6_spec.ip6dst, &server_sin->sin6_addr, 16);
+			memcpy(&add.fs.h_u.tcp_ip6_spec.pdst, &server_sin->sin6_port, 2);
+
+			add.fs.m_u.tcp_ip6_spec.ip6dst[0] = 0xffffffff;
+			add.fs.m_u.tcp_ip6_spec.ip6dst[1] = 0xffffffff;
+			add.fs.m_u.tcp_ip6_spec.ip6dst[2] = 0xffffffff;
+			add.fs.m_u.tcp_ip6_spec.ip6dst[3] = 0xffffffff;
+			add.fs.m_u.tcp_ip6_spec.pdst = 0xffff;
+		} else {
+			memcpy(add.fs.h_u.tcp_ip6_spec.ip6src, &server_sin->sin6_addr, 16);
+			memcpy(&add.fs.h_u.tcp_ip6_spec.psrc, &server_sin->sin6_port, 2);
+
+			add.fs.m_u.tcp_ip6_spec.ip6src[0] = 0xffffffff;
+			add.fs.m_u.tcp_ip6_spec.ip6src[1] = 0xffffffff;
+			add.fs.m_u.tcp_ip6_spec.ip6src[2] = 0xffffffff;
+			add.fs.m_u.tcp_ip6_spec.ip6src[3] = 0xffffffff;
+			add.fs.m_u.tcp_ip6_spec.psrc = 0xffff;
+		}
 	}
 
-	add.fs.flow_type |= FLOW_RSS;
+	if (rss_context >= 0) {
+		add.rss_context = rss_context;
+		add.fs.flow_type |= FLOW_RSS;
+	} else {
+		add.fs.ring_cookie = queue;
+	}
 
 	return ethtool(ifname, &add);
 }
@@ -194,7 +227,8 @@ static int rss_context_equal(struct session_state_devmem *devmem, int start_queu
 
 	devmem->rss_context = set->rss_context;
 
-	if (add_steering_rule(addr, devmem->ifname, devmem->rss_context) < 0) {
+	if (add_steering_rule(addr, devmem->ifname, devmem->rss_context, -1,
+			      RSS_CONTEXT_RULE, true) < 0) {
 		warn("Failed to add rule to RSS context");
 		ret = -1;
 		goto delete_context;
@@ -782,6 +816,7 @@ int devmem_setup(struct session_state_devmem *devmem, int fd,
 	}
 
 	max_kernel_queue = rxqn - num_queues;
+	devmem->queue_alloc = max_kernel_queue;
 
 	reset_flow_steering(ifname);
 	if (rss_equal(ifname, max_kernel_queue)) {
@@ -835,6 +870,30 @@ sock_destroy:
 	devmem->ys = NULL;
 
 	return ret;
+}
+
+int devmem_setup_rx_socket(struct session_state_devmem *devmem, int fd)
+{
+	struct sockaddr_in6 addr;
+	socklen_t optlen;
+	static int idx = 0;
+
+	optlen = sizeof(addr);
+	if (getpeername(fd, (struct sockaddr *)&addr, &optlen) < 0) {
+		warn("Failed to query socket address");
+		return -1;
+	}
+
+	if (addr.sin6_family == AF_INET)
+		inet_to_inet6((void *)&addr, &addr);
+
+	if (add_steering_rule(&addr, devmem->ifname, -1,
+			      devmem->queue_alloc++, ++idx, false) < 0) {
+		warnx("failed to add per-conn steering rule");
+		return -1;
+	}
+
+	return 0;
 }
 
 int devmem_teardown(struct session_state_devmem *devmem)
