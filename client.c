@@ -630,10 +630,31 @@ int main(int argc, char *argv[])
 			errx(1, "Cross-pin only works with 2 connections");
 	}
 
+	if (strcmp(opt.cpu_src_wrk_affinity, "")) {
+		if (opt.xpin)
+			errx(1, "--cross-pin and --cpu-src-wrk-affinity are mutually exclusive");
+		if (opt.pin_off != 0)
+			errx(1, "--pin-off and --cpu-src-wrk-affinity are mutually exclusive");
+		if (opt.cpu_src_wrk != -1)
+			errx(1, "--cpu-src-wrk and --cpu-src-wrk-affinity are mutually exclusive");
+	}
+
+	if (strcmp(opt.cpu_dst_wrk_affinity, "")) {
+		if (opt.xpin)
+			errx(1, "--cross-pin and --cpu-dst-wrk-affinity are mutually exclusive");
+		if (opt.pin_off != 0)
+			errx(1, "--pin-off and --cpu-dst-wrk-affinity are mutually exclusive");
+		if (opt.cpu_dst_wrk != -1)
+			errx(1, "--cpu-dst-wrk and --cpu-dst-wrk-affinity are mutually exclusive");
+	}
+
+	fprintf(stderr, "%s:%d\n", __func__, __LINE__);
 	if (strcmp(opt.cpu_dst_wrk_affinity, "")) {
 		if (parse_cpu_list(opt.cpu_dst_wrk_affinity, &dst_ca) < 0)
 			warnx("failed to parse dst affinity list %s", opt.cpu_dst_wrk_affinity);
+	}
 
+	if (strcmp(opt.cpu_src_wrk_affinity, "")) {
 		if (parse_cpu_list(opt.cpu_src_wrk_affinity, &src_ca) < 0)
 			warnx("failed to parse src affinity list %s", opt.cpu_src_wrk_affinity);
 	}
@@ -681,12 +702,6 @@ int main(int argc, char *argv[])
 
 	if (opt.msg_trunc && opt.devmem_rx)
 		errx(1, "--msg-trunc and --devmem-rx are mutually exclusive");
-
-	if (opt.pin_off && opt.devmem_rx)
-		errx(1, "--msg-trunc and --devmem-rx are mutually exclusive");
-
-
-	// check mutual exclusivity of xpin and affinity options and pinning options
 
 	if (opt.msg_trunc)
 		rx_mode = KPM_RX_MODE_SOCKET_TRUNC;
