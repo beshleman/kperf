@@ -524,6 +524,16 @@ server_msg_mode(struct session_state *self, struct kpm_header *hdr)
 		}
 	}
 
+	if (!self->tcp_sock && (req->tx_mode == KPM_TX_MODE_DEVMEM)) {
+		ret = devmem_setup_tx(&self->devmem, MEMORY_PROVIDER_HOST, &req->dev,
+				      req->dmabuf_tx_size_mb);
+		if (ret < 0) {
+			warnx("Failed to setup devmem_tx");
+			self->quit = 1;
+			return;
+		}
+	}
+
 	self->rx_mode = req->rx_mode;
 	self->tx_mode = req->tx_mode;
 	self->validate = req->validate;
@@ -564,7 +574,8 @@ server_msg_spawn_pworker(struct session_state *self, struct kpm_header *hdr)
 	if (!pwrk->pid) {
 		close(p[0]);
 		pworker_main(p[1], self->rx_mode, self->tx_mode, self->devmem.mem,
-			     self->validate);
+			     self->validate, !self->tcp_sock &&
+					     (self->tx_mode == KPM_TX_MODE_DEVMEM));
 		exit(1);
 	}
 
@@ -733,9 +744,12 @@ bad_req:
 			 KPM_MSG_WORKER_TEST);
 		for (j = 0; j < msg->n_conns; j++) {
 			conn = session_find_connection_by_id(self, msg->specs[j].connection_id);
+
 			fdpass_send(pwrk->fd, conn->fd);
 			/* close to ensure the only open descriptors are owned by the worker. */
 			close(conn->fd);
+			if (!self->tcp_sock && (self->tx_mode == KPM_TX_MODE_DEVMEM))
+				fdpass_send(pwrk->fd, self->devmem.tx_mem->fd);
 		}
 	}
 
@@ -1034,6 +1048,8 @@ static void server_session_loop(int fd)
 	}
 	if (self.tcp_sock && self.rx_mode == KPM_RX_MODE_DEVMEM)
 		devmem_teardown(&self.devmem);
+	if (!self.tcp_sock && self.tx_mode == KPM_TX_MODE_DEVMEM)
+		devmem_teardown_tx(&self.devmem);
 }
 
 static NORETURN void server_session(int fd)

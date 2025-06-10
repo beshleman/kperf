@@ -27,6 +27,7 @@ static struct {
 	bool devmem_rx;
 	enum memory_provider_type devmem_rx_memory;
 	struct pci_dev devmem_dst_dev;
+	bool devmem_tx;
 	bool msg_zerocopy;
 	bool tls;
 	bool tls_rx;
@@ -56,6 +57,7 @@ static struct {
 	unsigned int max_pace;
 	char *tcp_cong_ctrl;
 	unsigned int dmabuf_rx_size_mb;
+	unsigned int dmabuf_tx_size_mb;
 	unsigned int num_rx_queues;
 	bool validate;
 } opt = {
@@ -75,6 +77,7 @@ static struct {
 	.n_conns = 1,
 	/* 128M is enough to drive one queue at 200G */
 	.dmabuf_rx_size_mb = 128,
+	.dmabuf_tx_size_mb = 128,
 	.num_rx_queues = 1,
 	.devmem_rx_memory = MEMORY_PROVIDER_HOST,
 	.devmem_dst_dev = {
@@ -243,6 +246,9 @@ static const struct opt_table opts[] = {
 		     "Select the memory provider for TCP Devmem RX"),
 	OPT_WITH_ARG("--dmabuf-rx-size-mb <arg>", opt_set_uintval, opt_show_uintval,
 		     &opt.dmabuf_rx_size_mb, "Size of RX dmabuf for TCP Devmem mode"),
+	OPT_WITH_ARG("--dmabuf-tx-size-mb <arg>", opt_set_uintval, opt_show_uintval,
+		     &opt.dmabuf_tx_size_mb, "Size of TX dmabuf for TCP Devmem mode"),
+	OPT_WITHOUT_ARG("--devmem-tx", opt_set_bool, &opt.devmem_tx, "Use TCP Devmem on transmit"),
 	OPT_WITH_ARG("--num-rx-queues <arg>", opt_set_uintval, opt_show_uintval,
 		     &opt.num_rx_queues, "Number of RX queues for TCP Devmem mode"),
 	OPT_WITH_ARG("--validate <yes|no>", opt_set_bool_arg, NULL, &opt.validate,
@@ -702,8 +708,13 @@ int main(int argc, char *argv[])
 	if (opt.validate && opt.devmem_rx_memory == MEMORY_PROVIDER_CUDA)
 		errx(1, "--devmem-rx-memory cuda does not support --validate yes");
 
+	if (opt.msg_zerocopy && opt.devmem_tx)
+		errx(1, "--msg-zerocopy and --devmem-tx are mutually exclusive");
+
 	if (opt.msg_zerocopy)
 		tx_mode = KPM_TX_MODE_SOCKET_ZEROCOPY;
+	else if (opt.devmem_tx)
+		tx_mode = KPM_TX_MODE_DEVMEM;
 
 	src_wrk_id = calloc(opt.n_conns, sizeof(*src_wrk_id));
 	dst_wrk_id = calloc(opt.n_conns, sizeof(*dst_wrk_id));
@@ -744,14 +755,14 @@ int main(int argc, char *argv[])
 	}
 
 	if (kpm_req_mode(dst, rx_mode, tx_mode, opt.dmabuf_rx_size_mb,
-			 opt.num_rx_queues, opt.validate,
+			 opt.dmabuf_tx_size_mb, opt.num_rx_queues, opt.validate,
 			 opt.devmem_rx_memory, &opt.devmem_dst_dev) < 0) {
 		warnx("Failed setup destination mode");
 		goto out;
 	}
 
 	if (kpm_req_mode(src, rx_mode, tx_mode, opt.dmabuf_rx_size_mb,
-			 opt.num_rx_queues, opt.validate,
+			 opt.dmabuf_tx_size_mb, opt.num_rx_queues, opt.validate,
 			 opt.devmem_rx_memory, &opt.devmem_dst_dev) < 0) {
 		warnx("Failed setup source mode");
 		goto out;
