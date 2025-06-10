@@ -525,7 +525,7 @@ server_msg_mode(struct session_state *self, struct kpm_header *hdr)
 	}
 
 	if (!self->tcp_sock && (req->tx_mode == KPM_TX_MODE_DEVMEM)) {
-		ret = devmem_setup_tx(&self->devmem, MEMORY_PROVIDER_HOST, &req->dev,
+		ret = devmem_setup_tx(&self->devmem, req->tx_provider, &req->dev,
 				      req->dmabuf_tx_size_mb);
 		if (ret < 0) {
 			warnx("Failed to setup devmem_tx");
