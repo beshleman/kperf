@@ -77,6 +77,18 @@ struct test {
 };
 
 /*
+ * Returns true if a session is configured to be a devmem TX source. Otherwise,
+ * returns false.
+ *
+ * This function is unable to use self->devmem.tx_mem state because it must
+ * support being called before tx_mem is allocated.
+ */
+static bool server_session_devmem_tx(struct session_state *self, enum kpm_tx_mode mode)
+{
+	return !self->tcp_sock && (mode == KPM_TX_MODE_DEVMEM);
+}
+
+/*
  * Returns true if a session is configured to be a devmem RX destination. Otherwise,
  * returns false.
  */
@@ -533,6 +545,16 @@ server_msg_mode(struct session_state *self, struct kpm_header *hdr)
 		}
 	}
 
+	if (server_session_devmem_tx(self, req->tx_mode)) {
+		ret = devmem_setup_tx(&self->devmem, req->tx_provider, &req->dev,
+				      req->dmabuf_size_mb);
+		if (ret < 0) {
+			warnx("Failed to setup devmem_tx");
+			self->quit = 1;
+			return;
+		}
+	}
+
 	self->rx_mode = req->rx_mode;
 	self->tx_mode = req->tx_mode;
 	self->validate = req->validate;
@@ -573,7 +595,7 @@ server_msg_spawn_pworker(struct session_state *self, struct kpm_header *hdr)
 	if (!pwrk->pid) {
 		close(p[0]);
 		pworker_main(p[1], self->rx_mode, self->tx_mode, self->devmem.mem,
-			     self->validate);
+			     self->validate, server_session_devmem_tx(self, self->tx_mode));
 		exit(1);
 	}
 
@@ -742,9 +764,12 @@ bad_req:
 			 KPM_MSG_WORKER_TEST);
 		for (j = 0; j < msg->n_conns; j++) {
 			conn = session_find_connection_by_id(self, msg->specs[j].connection_id);
+
 			fdpass_send(pwrk->fd, conn->fd);
 			/* close to ensure the only open descriptors are owned by the worker. */
 			close(conn->fd);
+			if (server_session_devmem_tx(self, self->tx_mode))
+				fdpass_send(pwrk->fd, self->devmem.tx_mem->fd);
 		}
 	}
 
@@ -1043,6 +1068,8 @@ static void server_session_loop(int fd)
 	}
 	if (server_session_devmem_rx(&self, self.rx_mode))
 		devmem_teardown(&self.devmem);
+	if (server_session_devmem_tx(&self, self.tx_mode))
+		devmem_teardown_tx(&self.devmem);
 }
 
 static NORETURN void server_session(int fd)
