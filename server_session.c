@@ -580,7 +580,9 @@ server_msg_spawn_pworker(struct session_state *self, struct kpm_header *hdr)
 		pworker_main(p[1], self->rx_mode, self->tx_mode, self->devmem.mem,
 			     self->validate, !self->tcp_sock &&
 					     (self->tx_mode == KPM_TX_MODE_DEVMEM),
-					     self->devmem.tx_mem->dmabuf_id);
+					     self->devmem.tx_mem
+						? self->devmem.tx_mem->dmabuf_id
+						: -1);
 		exit(1);
 	}
 
