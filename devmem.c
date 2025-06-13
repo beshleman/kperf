@@ -311,7 +311,13 @@ static int bind_tx_queue(unsigned int ifindex, unsigned int dmabuf_fd,
 	struct netdev_bind_tx_rsp *rsp = NULL;
 	int ret;
 
+	fprintf(stderr, "%s: ifindex=%d dmabuf_fd=%d\n", __func__, ifindex, dmabuf_fd);
+
 	req = netdev_bind_tx_req_alloc();
+	if (!req) {
+		warnx("netdev_bind_tx_req_alloc() failed");
+		return -1;
+	}
 	netdev_bind_tx_req_set_ifindex(req, ifindex);
 	netdev_bind_tx_req_set_fd(req, dmabuf_fd);
 
@@ -686,26 +692,6 @@ static struct memory_provider *get_memory_provider(enum memory_provider_type pro
 	}
 }
 
-int devmem_setup_tx(struct session_state_devmem *devmem, enum memory_provider_type provider,
-		    struct pci_dev *dev, size_t dmabuf_tx_size_mb)
-{
-	txmp = get_memory_provider(provider);
-	if (!txmp)
-		return -1;
-
-	if (txmp->dev_init && txmp->dev_init(dev) < 0)
-		return -1;
-
-	devmem->tx_mem = txmp->alloc(dmabuf_tx_size_mb * 1024 * 1024);
-	if (!devmem->tx_mem) {
-		warnx("Failed to allocate devmem tx buffer");
-		return -1;
-	}
-
-	txmp->memcpy_to_device(devmem->tx_mem, 0, patbuf, sizeof(patbuf));
-	return 0;
-}
-
 /* Setup Devmem RX */
 int devmem_setup(struct session_state_devmem *devmem, int fd,
 		 size_t dmabuf_rx_size_mb, int num_queues,
@@ -1010,29 +996,44 @@ int devmem_sendmsg(int fd, struct connection_devmem *devmem, size_t off, size_t 
 	cmsg->cmsg_len = CMSG_LEN(sizeof(int));
 	*((int *)CMSG_DATA(cmsg)) = devmem->dmabuf_id;
 
+#if 0
 	return sendmsg(fd, &msg, MSG_ZEROCOPY);
+#else
+	return sendmsg(fd, &msg, MSG_SOCK_DEVMEM);
+#endif
 }
 
-/* Setup Devmem TX */
-int devmem_setup_conn(int fd, struct connection_devmem *devmem, int dmabuf_fd)
+int devmem_setup_tx(struct session_state_devmem *devmem, int fd, int main_sock)
 {
 	char ifname[IFNAMSIZ] = {};
-	struct sockaddr_in6 addr;
+	struct sockaddr_in6 src;
 	struct ynl_error yerr;
 	socklen_t optlen;
 	int ifindex;
 	int ret;
 
-	optlen = sizeof(addr);
-	if (getsockname(fd, (struct sockaddr *)&addr, &optlen) < 0) {
-		warn("Failed to query socket address");
+	optlen = sizeof(src);
+	if (getsockname(main_sock, (struct sockaddr *)&src, &optlen) < 0) {
+		warn("Failed to query main socket address");
 		return -1;
 	}
 
-	if (addr.sin6_family == AF_INET)
-		inet_to_inet6((void *)&addr, &addr);
+	txmp = get_memory_provider(devmem->tx_provider);
+	if (!txmp)
+		return -1;
 
-	ifindex = find_iface(&addr, ifname);
+	if (txmp->dev_init && txmp->dev_init(&devmem->tx_dev) < 0)
+		return -1;
+
+	devmem->tx_mem = txmp->alloc(devmem->dmabuf_tx_size_mb * 1024 * 1024);
+	if (!devmem->tx_mem) {
+		warnx("Failed to allocate devmem tx buffer");
+		return -1;
+	}
+
+	txmp->memcpy_to_device(devmem->tx_mem, 0, patbuf, sizeof(patbuf));
+
+	ifindex = find_iface(&src, ifname);
 	if (ifindex < 0) {
 		warnx("Failed to resolve ifindex: %s", strerror(-ifindex));
 		return -1;
@@ -1044,11 +1045,15 @@ int devmem_setup_conn(int fd, struct connection_devmem *devmem, int dmabuf_fd)
 		return -1;
 	}
 
-	devmem->dmabuf_id = bind_tx_queue(ifindex, dmabuf_fd, devmem->ys);
-	if (devmem->dmabuf_id < 0) {
+	devmem->tx_mem->dmabuf_id = bind_tx_queue(ifindex, devmem->tx_mem->fd, devmem->ys);
+	if (devmem->tx_mem->dmabuf_id < 0) {
+		warnx("Failed to bind TX queue dmabuf: %d\n", devmem->tx_mem->dmabuf_id);
 		ret = -1;
 		goto sock_destroy;
 	}
+
+	fprintf(stderr, "%s: ifname=%s dmabuf_id=%d\n",
+		__func__, ifname, devmem->tx_mem->dmabuf_id);
 
 	if (setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, ifname, IFNAMSIZ)) {
 		warn("failed to bind device to socket");
@@ -1067,11 +1072,4 @@ sock_destroy:
 void devmem_teardown_tx(struct session_state_devmem *devmem)
 {
 	if (txmp)
-		txmp->free(devmem->tx_mem);
-}
-
-void devmem_teardown_conn(struct connection_devmem *devmem)
-{
-	ynl_sock_destroy(devmem->ys);
-	devmem->ys = NULL;
-}
+		txmp->free(devmem->tx_mem); }

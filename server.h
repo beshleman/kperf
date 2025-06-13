@@ -88,14 +88,22 @@ struct connection_devmem {
 struct session_state_devmem {
 	struct ynl_sock *ys;
 	char ifname[IFNAMSIZ];
+
+	/* RX */
 	struct memory_buffer *mem;
-	struct memory_buffer *tx_mem;
 	int rss_context;
+
+	/* TX */
+	struct memory_buffer *tx_mem;
+	struct pci_dev tx_dev;
+	__u32 dmabuf_tx_size_mb;
+	enum memory_provider_type tx_provider;
 };
 
 struct worker_state_devmem {
 	struct memory_buffer *mem;
 	bool tx_worker;
+	int dmabuf_id;
 };
 
 struct server_session *
@@ -103,12 +111,11 @@ server_session_spawn(int fd, struct sockaddr_in6 *addr, socklen_t *addrlen);
 
 void NORETURN pworker_main(int fd, enum kpm_rx_mode rx_mode, enum kpm_tx_mode tx_mode,
 			   struct memory_buffer *devmem, bool validate,
-			   bool use_devmem_tx);
+			   bool use_devmem_tx, int dmabuf_id);
 
 int devmem_setup(struct session_state_devmem *devmem, int fd,
 		 size_t dmabuf_size, int num_queues,
 		 enum memory_provider_type provider, struct pci_dev *dev);
-int devmem_setup_tx(struct session_state_devmem *devmem, enum memory_provider_type provider, struct pci_dev *dev, size_t dmabuf_tx_size_mb);
 int devmem_teardown(struct session_state_devmem *devmem);
 void devmem_teardown_tx(struct session_state_devmem *devmem);
 int devmem_release_tokens(int fd, struct connection_devmem *conn);
@@ -116,7 +123,8 @@ ssize_t devmem_recv(int fd, struct connection_devmem *conn,
 		    unsigned char *rxbuf, size_t chunk, struct memory_buffer *mem,
 		    int rep, __u64 tot_recv, bool validate);
 int devmem_sendmsg(int fd, struct connection_devmem *devmem, size_t off, size_t n);
-int devmem_setup_conn(int fd, struct connection_devmem *devmem, int dmabuf_fd);
 void devmem_teardown_conn(struct connection_devmem *devmem);
+int devmem_prepare_connect(int fd, struct sockaddr_in6 *src, struct session_state_devmem *devmem);
 
+int devmem_setup_tx(struct session_state_devmem *devmem, int fd, int main_sock);
 #endif /* SERVER_H */

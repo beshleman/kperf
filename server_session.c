@@ -246,6 +246,14 @@ server_msg_connect(struct session_state *self, struct kpm_header *hdr)
 		goto err_close;
 	}
 
+	if (self->tx_mode == KPM_TX_MODE_DEVMEM) {
+		if (devmem_setup_tx(&self->devmem, cfd, self->main_sock) < 0) {
+			warnx("Failed to setup devmem TX");
+			goto err_close;
+		}
+
+	}
+
 	ret = connect(cfd, (void *)&req->addr, req->len);
 	if (ret < 0) {
 		warn("Failed to connect");
@@ -524,19 +532,15 @@ server_msg_mode(struct session_state *self, struct kpm_header *hdr)
 		}
 	}
 
-	if (!self->tcp_sock && (req->tx_mode == KPM_TX_MODE_DEVMEM)) {
-		ret = devmem_setup_tx(&self->devmem, req->tx_provider, &req->dev,
-				      req->dmabuf_tx_size_mb);
-		if (ret < 0) {
-			warnx("Failed to setup devmem_tx");
-			self->quit = 1;
-			return;
-		}
-	}
-
 	self->rx_mode = req->rx_mode;
 	self->tx_mode = req->tx_mode;
 	self->validate = req->validate;
+
+	if (!self->tcp_sock && (req->tx_mode == KPM_TX_MODE_DEVMEM)) {
+		self->devmem.tx_provider = req->tx_provider;
+		self->devmem.dmabuf_tx_size_mb = req->dmabuf_tx_size_mb;
+		memcpy(&self->devmem.tx_dev, &req->dev, sizeof(self->devmem.tx_dev));
+	}
 
 	if (kpm_reply_empty(self->main_sock, hdr) < 1) {
 		warnx("Reply failed");
@@ -575,7 +579,8 @@ server_msg_spawn_pworker(struct session_state *self, struct kpm_header *hdr)
 		close(p[0]);
 		pworker_main(p[1], self->rx_mode, self->tx_mode, self->devmem.mem,
 			     self->validate, !self->tcp_sock &&
-					     (self->tx_mode == KPM_TX_MODE_DEVMEM));
+					     (self->tx_mode == KPM_TX_MODE_DEVMEM),
+					     self->devmem.tx_mem->dmabuf_id);
 		exit(1);
 	}
 
@@ -748,8 +753,10 @@ bad_req:
 			fdpass_send(pwrk->fd, conn->fd);
 			/* close to ensure the only open descriptors are owned by the worker. */
 			close(conn->fd);
+#if 0
 			if (!self->tcp_sock && (self->tx_mode == KPM_TX_MODE_DEVMEM))
 				fdpass_send(pwrk->fd, self->devmem.tx_mem->fd);
+#endif
 		}
 	}
 
@@ -935,6 +942,7 @@ session_wmsg_test(struct session_state *self, struct kpm_header *hdr)
 		warn("Failed to find test for result");
 
 	test->workers_done++;
+	fprintf(stderr, "%p wid %u min_wid %u\n", test->results, worker_id, test->min_worker_id);
 	if (test->results[worker_id - test->min_worker_id])
 		warnx("Results already reported for worker %d", worker_id);
 	test->results[worker_id - test->min_worker_id] = kpm_msg_dup(&msg->hdr);

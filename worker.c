@@ -93,8 +93,6 @@ worker_kill_conn(struct worker_state *self, struct connection *conn)
 		warn("Failed to del poll out");
 	if (self->rx_mode == KPM_RX_MODE_DEVMEM)
 		(void)devmem_release_tokens(conn->fd, &conn->devmem);
-	if (self->devmem.tx_worker)
-		devmem_teardown_conn(&conn->devmem);
 	close(conn->fd);
 	list_del(&conn->connections);
 	free(conn->rxbuf);
@@ -273,16 +271,6 @@ worker_msg_test(struct worker_state *self, struct kpm_header *hdr)
 		conn->spec = &self->test->specs[i];
 		conn->id = req->specs[i].connection_id;
 		conn->fd = fdpass_recv(self->main_sock);
-
-		/* Only devmem TX sessions/workers have a dmabuf fd to pass */
-		if (self->devmem.tx_worker) {
-			int dmabuf_fd = fdpass_recv(self->main_sock);
-
-			if (devmem_setup_conn(conn->fd, &conn->devmem, dmabuf_fd) < 0) {
-				self->quit = 1;
-				return;
-			}
-		}
 
 		info_len = sizeof(conn->init_info);
 		if (getsockopt(conn->fd, IPPROTO_TCP, TCP_INFO,
@@ -598,6 +586,7 @@ worker_handle_send(struct worker_state *self, struct connection *conn,
 		chunk = min_t(size_t, conn->write_size, conn->to_send);
 
 		if (self->tx_mode == KPM_TX_MODE_DEVMEM) {
+			conn->devmem.dmabuf_id = self->devmem.dmabuf_id;
 			n = devmem_sendmsg(conn->fd, &conn->devmem,
 					   conn->tot_sent % PATTERN_PERIOD, chunk);
 		} else {
@@ -742,14 +731,14 @@ worker_handle_conn(struct worker_state *self, int fd, unsigned int events)
 /* == Main loop == */
 
 void NORETURN pworker_main(int fd, enum kpm_rx_mode rx_mode, enum kpm_tx_mode tx_mode,
-			   struct memory_buffer *devmem, bool validate, bool tx_worker)
+			   struct memory_buffer *devmem, bool validate, bool tx_worker, int dmabuf_id)
 {
 	struct worker_state self = {
 		.main_sock = fd,
 		.rx_mode = rx_mode,
 		.tx_mode = tx_mode,
 		.validate = validate,
-		.devmem = { .mem = devmem, .tx_worker = tx_worker },
+		.devmem = { .mem = devmem, .tx_worker = tx_worker, .dmabuf_id = dmabuf_id },
 	};
 	struct epoll_event ev, events[32];
 	int i, nfds;
