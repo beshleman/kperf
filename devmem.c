@@ -311,8 +311,6 @@ static int bind_tx_queue(unsigned int ifindex, unsigned int dmabuf_fd,
 	struct netdev_bind_tx_rsp *rsp = NULL;
 	int ret;
 
-	fprintf(stderr, "%s: ifindex=%d dmabuf_fd=%d\n", __func__, ifindex, dmabuf_fd);
-
 	req = netdev_bind_tx_req_alloc();
 	if (!req) {
 		warnx("netdev_bind_tx_req_alloc() failed");
@@ -996,11 +994,7 @@ int devmem_sendmsg(int fd, struct connection_devmem *devmem, size_t off, size_t 
 	cmsg->cmsg_len = CMSG_LEN(sizeof(int));
 	*((int *)CMSG_DATA(cmsg)) = devmem->dmabuf_id;
 
-#if 0
 	return sendmsg(fd, &msg, MSG_ZEROCOPY);
-#else
-	return sendmsg(fd, &msg, MSG_SOCK_DEVMEM);
-#endif
 }
 
 int devmem_setup_tx(struct session_state_devmem *devmem, int fd, int main_sock)
@@ -1051,9 +1045,6 @@ int devmem_setup_tx(struct session_state_devmem *devmem, int fd, int main_sock)
 		ret = -1;
 		goto sock_destroy;
 	}
-
-	fprintf(stderr, "%s: ifname=%s dmabuf_id=%d\n",
-		__func__, ifname, devmem->tx_mem->dmabuf_id);
 
 	if (setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, ifname, IFNAMSIZ)) {
 		warn("failed to bind device to socket");
