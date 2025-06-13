@@ -753,10 +753,6 @@ bad_req:
 			fdpass_send(pwrk->fd, conn->fd);
 			/* close to ensure the only open descriptors are owned by the worker. */
 			close(conn->fd);
-#if 0
-			if (!self->tcp_sock && (self->tx_mode == KPM_TX_MODE_DEVMEM))
-				fdpass_send(pwrk->fd, self->devmem.tx_mem->fd);
-#endif
 		}
 	}
 

@@ -1012,12 +1012,6 @@ int devmem_setup_tx(struct session_state_devmem *devmem, int fd, int main_sock)
 	int ifindex;
 	int ret;
 
-	optlen = sizeof(src);
-	if (getsockname(main_sock, (struct sockaddr *)&src, &optlen) < 0) {
-		warn("Failed to query main socket address");
-		return -1;
-	}
-
 	txmp = get_memory_provider(devmem->tx_provider);
 	if (!txmp)
 		return -1;
@@ -1032,6 +1026,12 @@ int devmem_setup_tx(struct session_state_devmem *devmem, int fd, int main_sock)
 	}
 
 	txmp->memcpy_to_device(devmem->tx_mem, 0, patbuf, sizeof(patbuf));
+
+	optlen = sizeof(src);
+	if (getsockname(main_sock, (struct sockaddr *)&src, &optlen) < 0) {
+		warn("Failed to query main socket address");
+		return -1;
+	}
 
 	ifindex = find_iface(&src, ifname);
 	if (ifindex < 0) {
@@ -1072,4 +1072,5 @@ sock_destroy:
 void devmem_teardown_tx(struct session_state_devmem *devmem)
 {
 	if (txmp)
-		txmp->free(devmem->tx_mem); }
+		txmp->free(devmem->tx_mem);
+}
