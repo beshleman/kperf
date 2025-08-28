@@ -16,8 +16,6 @@
 struct worker_state {
 	int main_sock;
 	struct worker_opts opts;
-	enum kpm_rx_mode rx_mode;
-	enum kpm_tx_mode tx_mode;
 	int epollfd;
 	unsigned int id;
 	int quit;
