@@ -712,6 +712,7 @@ server_msg_spawn_worker(struct session_state *self, struct kpm_header *hdr)
 		free(opts);
 		goto err_free_attr;
 	}
+	pthread_attr_destroy(&attr);
 
 	self->iou_state.queue_id++;
 	wrk->id = ++self->worker_ids;

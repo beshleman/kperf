@@ -5,6 +5,7 @@
 
 #include <errno.h>
 #include <stdlib.h>
+#include <unistd.h>
 #include <sys/epoll.h>
 #include <linux/errqueue.h>
 #include <sys/mman.h>
@@ -472,6 +473,7 @@ static void ep_wait(struct worker_state *self, int msec)
 
 static void ep_exit(struct worker_state *self)
 {
+	close(self->main_sock);
 }
 
 static const struct io_ops epoll_io_ops = {
