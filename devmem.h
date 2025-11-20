@@ -12,7 +12,8 @@ void unreserve_queues(char *ifname, int rss_context);
 
 int devmem_setup(struct session_state_devmem *devmem, int fd,
 		 size_t dmabuf_size, int num_queues,
-		 enum memory_provider_type provider, struct pci_dev *dev);
+		 enum memory_provider_type provider, struct pci_dev *dev,
+		 bool autorelease);
 int devmem_teardown(struct session_state_devmem *devmem);
 void devmem_teardown_tx(struct session_state_devmem *devmem);
 int devmem_release_tokens(int fd, struct connection_devmem *conn);

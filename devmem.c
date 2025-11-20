@@ -313,7 +313,8 @@ static int rxq_num(int ifindex)
 
 static int bind_rx_queue(unsigned int ifindex, unsigned int dmabuf_fd,
 			 struct netdev_queue_id *queues,
-			 unsigned int n_queue_index, struct ynl_sock *ys)
+			 unsigned int n_queue_index, struct ynl_sock *ys,
+			 bool autorelease)
 {
 	struct netdev_bind_rx_req *req;
 	struct netdev_bind_rx_rsp *rsp;
@@ -325,6 +326,7 @@ static int bind_rx_queue(unsigned int ifindex, unsigned int dmabuf_fd,
 
 	netdev_bind_rx_req_set_ifindex(req, ifindex);
 	netdev_bind_rx_req_set_fd(req, dmabuf_fd);
+	netdev_bind_rx_req_set_autorelease(req, autorelease);
 	__netdev_bind_rx_req_set_queues(req, queues, n_queue_index);
 
 	rsp = netdev_bind_rx(ys, req);
@@ -827,7 +829,7 @@ void unreserve_queues(char *ifname, int rss_context)
 int devmem_setup(struct session_state_devmem *devmem, int fd,
 		 size_t dmabuf_rx_size_mb, int num_queues,
 		 enum memory_provider_type provider,
-		 struct pci_dev *dev)
+		 struct pci_dev *dev, bool autorelease)
 {
 	struct netdev_queue_id *queues;
 	struct ynl_error yerr;
@@ -879,7 +881,7 @@ int devmem_setup(struct session_state_devmem *devmem, int fd,
 	}
 
         devmem->mem->dmabuf_id = bind_rx_queue(ifindex, devmem->mem->fd, queues,
-                                          num_queues, devmem->ys);
+                                          num_queues, devmem->ys, autorelease);
         if (devmem->mem->dmabuf_id < 0) {
 		warnx("Failed to bind RX queue");
 		ret = -1;

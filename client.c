@@ -31,6 +31,7 @@ static struct {
 	struct pci_dev devmem_dst_dev;
 	struct pci_dev devmem_src_dev;
 	bool devmem_tx;
+	bool devmem_autorelease;
 	bool msg_zerocopy;
 	bool tls;
 	bool tls_rx;
@@ -277,6 +278,8 @@ static const struct opt_table opts[] = {
 		     &opt.devmem_dst_dev, "Select the destination device for the TCP Devmem memory provider"),
 	OPT_WITH_ARG("--devmem-src-dev <arg>", opt_set_dev, opt_show_dev,
 		     &opt.devmem_src_dev, "Select the source device for the TCP Devmem memory provider"),
+	OPT_WITHOUT_ARG("--devmem-autorelease", opt_set_bool, &opt.devmem_autorelease,
+			"Enable automatic token release on socket close"),
 	OPT_WITHOUT_ARG("--iou-src", opt_set_bool, &opt.iou_src,
 			"Use io_uring on source server"),
 	OPT_WITHOUT_ARG("--iou-dst", opt_set_bool, &opt.iou_dst,
@@ -839,6 +842,7 @@ int main(int argc, char *argv[])
 		.num_rx_queues = opt.num_rx_queues,
 		.validate = opt.validate,
 		.iou = opt.iou_dst,
+		.devmem_autorelease = opt.devmem_autorelease,
 		.iou_rx_size_mb = opt.iou_rx_size_mb,
 	};
 	if (kpm_req_mode(dst, &dst_mode) < 0) {
@@ -858,6 +862,7 @@ int main(int argc, char *argv[])
 		.addr = src_addr,
 		.validate = opt.validate,
 		.iou = opt.iou_src,
+		.devmem_autorelease = opt.devmem_autorelease,
 		.iou_rx_size_mb = opt.iou_rx_size_mb,
 	};
 	if (kpm_req_mode(src, &src_mode) < 0) {
