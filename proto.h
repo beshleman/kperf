@@ -112,7 +112,7 @@ struct kpm_connection_id {
 struct kpm_max_pacing {
 	struct kpm_header hdr;
 	__u32 id;
-	__u32 max_pacing;
+	__u64 max_pacing;
 };
 
 #define KPM_CC_NAME_LEN 16
@@ -168,6 +168,15 @@ struct kpm_mode {
 	__u8 validate;
 	__u8 iou;
 	__u32 iou_rx_size_mb;
+
+	/* XPS pairing: map app CPUs to same TX queue as their net CPUs.
+	 * xps_irq_start: first net (IRQ) CPU for this interface.
+	 * xps_pin_off: offset from net CPU to app CPU (app = net + pin_off).
+	 * num_rx_queues doubles as the count of net CPUs to pair.
+	 * Set xps_pin_off=0 to disable pairing (identity XPS mapping).
+	 */
+	__u32 xps_pin_off;
+	__u32 xps_irq_start;
 };
 
 enum kpm_tls_mask {
@@ -198,7 +207,7 @@ enum kpm_test_type {
 };
 
 #define KPM_DFL_OP_CHUNK		(1 << 16)
-#define KPM_MAX_OP_CHUNK		(1 << 27)
+#define KPM_MAX_OP_CHUNK		(1 << 30)
 
 struct kpm_test {
 	struct kpm_header hdr;
@@ -299,7 +308,7 @@ int kpm_send_connect(int fd, struct sockaddr_in6 *addr, socklen_t len,
 		     __u32 mss);
 int kpm_send_tls(int fd, __u32 conn_id, __u32 dir_mask,
 		 void *info, socklen_t len);
-int kpm_send_max_pacing(int fd, __u32 id, __u32 max_pace);
+int kpm_send_max_pacing(int fd, __u32 id, __u64 max_pace);
 int kpm_send_tcp_cc(int fd, __u32 id, char *cc_name);
 int kpm_send_mode(int fd, struct kpm_mode *mode);
 int kpm_send_pin_worker(int fd, __u32 id, __u32 cpu);
@@ -322,7 +331,7 @@ int kpm_req_tcp_sock(int fd, struct sockaddr_in6 *addr, socklen_t *len);
 int kpm_req_end_test(int fd, __u32 test_id);
 int kpm_req_tls(int fd, __u32 conn_id, __u32 dir_mask,
 		void *info, socklen_t len);
-int kpm_req_pacing(int fd, __u32 conn_id, __u32 max_pace);
+int kpm_req_pacing(int fd, __u32 conn_id, __u64 max_pace);
 int kpm_req_tcp_cc(int fd, __u32 conn_id, char *cc_name);
 int kpm_req_mode(int fd, struct kpm_mode *mode);
 int kpm_req_disconnect(int fd, __u32 connection_id);

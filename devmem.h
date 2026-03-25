@@ -12,7 +12,8 @@ void unreserve_queues(char *ifname, int rss_context);
 
 int devmem_setup(struct session_state_devmem *devmem, int fd,
 		 size_t dmabuf_size, int num_queues,
-		 enum memory_provider_type provider, struct pci_dev *dev);
+		 enum memory_provider_type provider, struct pci_dev *dev,
+		 unsigned int xps_irq_start, unsigned int xps_pin_off);
 int devmem_teardown(struct session_state_devmem *devmem);
 void devmem_teardown_tx(struct session_state_devmem *devmem);
 int devmem_release_tokens(int fd, struct connection_devmem *conn);
@@ -23,7 +24,9 @@ int devmem_sendmsg(int fd, int dmabuf_id, size_t off, size_t n);
 void devmem_teardown_conn(struct connection_devmem *devmem);
 int devmem_prepare_connect(int fd, struct sockaddr_in6 *src, struct session_state_devmem *devmem);
 int devmem_setup_tx(struct session_state_devmem *devmem, enum memory_provider_type provider,
-		    int dmabuf_tx_size_mb, struct pci_dev *dev, struct sockaddr_in6 *addr);
+		    int dmabuf_tx_size_mb, struct pci_dev *dev, struct sockaddr_in6 *addr,
+		    unsigned int xps_irq_start, unsigned int num_irq_cpus,
+		    unsigned int xps_pin_off);
 int devmem_bind_socket(struct session_state_devmem *devmem, int fd);
 
 #endif /* DEVMEM_H */

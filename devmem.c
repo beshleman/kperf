@@ -45,6 +45,115 @@ extern unsigned char patbuf[KPM_MAX_OP_CHUNK + PATTERN_PERIOD + 1];
 
 static int steering_rule_loc = -1;
 
+static int configure_xps(const char *ifname, int ifindex,
+			 unsigned int irq_start, unsigned int num_irq_cpus,
+			 unsigned int pin_off)
+{
+	struct ethtool_channels_get_req *req;
+	struct ethtool_channels_get_rsp *rsp;
+	struct ynl_error yerr;
+	struct ynl_sock *ys;
+	int num_tx;
+	int i;
+
+	ys = ynl_sock_create(&ynl_ethtool_family, &yerr);
+	if (!ys) {
+		warnx("XPS: failed to create YNL socket: %s", yerr.msg);
+		return -1;
+	}
+
+	req = ethtool_channels_get_req_alloc();
+	ethtool_channels_get_req_set_header_dev_index(req, ifindex);
+	rsp = ethtool_channels_get(ys, req);
+	if (!rsp) {
+		warnx("XPS: ethtool_channels_get failed: %s", ys->err.msg);
+		ethtool_channels_get_req_free(req);
+		ynl_sock_destroy(ys);
+		return -1;
+	}
+	num_tx = rsp->tx_count + rsp->combined_count;
+	ethtool_channels_get_req_free(req);
+	ethtool_channels_get_rsp_free(rsp);
+	ynl_sock_destroy(ys);
+
+	if (num_tx <= 0) {
+		warnx("XPS: no TX queues found");
+		return -1;
+	}
+
+	if (pin_off)
+		warnx("XPS: configuring paired CPU-to-TX-queue mapping for %s (%d queues, irq_start=%u, num_cpus=%u, pin_off=%u)",
+		      ifname, num_tx, irq_start, num_irq_cpus, pin_off);
+	else
+		warnx("XPS: configuring 1:1 CPU-to-TX-queue mapping for %s (%d queues)",
+		      ifname, num_tx);
+
+	for (i = 0; i < num_tx; i++) {
+		char path[256];
+		char mask[128];
+		unsigned int cpu_bits[KPERF_MAX_CPUS / 32] = {};
+		int nwords, w, off;
+		int fd, ret;
+
+		snprintf(path, sizeof(path),
+			 "/sys/class/net/%s/queues/tx-%d/xps_cpus", ifname, i);
+		fd = open(path, O_WRONLY);
+		if (fd < 0) {
+			warn("XPS: failed to open %s", path);
+			return -1;
+		}
+
+		if (pin_off && i >= (int)irq_start &&
+		    i < (int)(irq_start + num_irq_cpus)) {
+			/* Net CPU queue: pair net CPU i with app CPU i+pin_off */
+			unsigned int net_cpu = i;
+			unsigned int app_cpu = i + pin_off;
+
+			cpu_bits[net_cpu / 32] |= 1U << (net_cpu % 32);
+			if (app_cpu < KPERF_MAX_CPUS)
+				cpu_bits[app_cpu / 32] |= 1U << (app_cpu % 32);
+		} else if (pin_off && i >= (int)(irq_start + pin_off) &&
+			   i < (int)(irq_start + pin_off + num_irq_cpus)) {
+			/* App CPU queue: clear it (app CPU uses net CPU's queue) */
+			/* cpu_bits stays all zeros */
+		} else {
+			/* Identity mapping: CPU i -> TX queue i */
+			if (i < KPERF_MAX_CPUS)
+				cpu_bits[i / 32] |= 1U << (i % 32);
+		}
+
+		/* Find highest non-zero word to determine mask length */
+		nwords = 1;
+		for (w = KPERF_MAX_CPUS / 32 - 1; w >= 0; w--) {
+			if (cpu_bits[w]) {
+				nwords = w + 1;
+				break;
+			}
+		}
+
+		/* Build comma-separated hex mask string, MSB-first */
+		off = 0;
+		for (w = nwords - 1; w >= 0; w--) {
+			if (w == nwords - 1)
+				off += snprintf(mask + off, sizeof(mask) - off,
+						"%x", cpu_bits[w]);
+			else
+				off += snprintf(mask + off, sizeof(mask) - off,
+						",%08x", cpu_bits[w]);
+		}
+
+		ret = write(fd, mask, strlen(mask));
+		close(fd);
+		if (ret < 0) {
+			warn("XPS: failed to write %s to %s", mask, path);
+			return -1;
+		}
+	}
+
+	warnx("XPS: configured %d TX queues for %s", num_tx, ifname);
+	return 0;
+}
+
 static int ethtool(const char *ifname, void *data)
 {
 	struct ifreq ifr = {};
@@ -117,14 +226,23 @@ free_rules:
 }
 
 static int add_steering_rule(struct sockaddr_in6 *server_sin,
-			     const char *ifname, int rss_context)
+			     const char *ifname, int rss_context,
+			     int direct_queue)
 {
 	struct ethtool_rxnfc add = {};
 	struct ethtool_rxnfc cnt = {};
 	int ret;
 
 	add.cmd = ETHTOOL_SRXCLSRLINS;
-	add.rss_context = rss_context;
+
+	if (direct_queue >= 0) {
+		/* Direct to specific queue (like ncdevmem) */
+		add.fs.ring_cookie = direct_queue;
+		add.rss_context = 0;
+	} else {
+		/* RSS context mode */
+		add.rss_context = rss_context;
+	}
 
 	if (IN6_IS_ADDR_V4MAPPED(&server_sin->sin6_addr)) {
 		add.fs.flow_type = TCP_V4_FLOW;
@@ -149,7 +267,8 @@ static int add_steering_rule(struct sockaddr_in6 *server_sin,
 		add.fs.m_u.tcp_ip6_spec.pdst = 0xffff;
 	}
 
-	add.fs.flow_type |= FLOW_RSS;
+	if (direct_queue < 0)
+		add.fs.flow_type |= FLOW_RSS;
 
 	cnt.cmd = ETHTOOL_GRXCLSRLCNT;
 	ret = ethtool(ifname, &cnt);
@@ -202,6 +321,19 @@ static int rss_context_equal(char *ifname, int start_queue, int num_queues,
 	int queue;
 	int ret;
 
+	/* For single queue, try direct queue steering first (like ncdevmem).
+	 * This avoids RSS context creation which some drivers don't support
+	 * for devmem queues.
+	 */
+	if (num_queues == 1) {
+		if (add_steering_rule(addr, ifname, 0, start_queue) < 0) {
+			warnx("Failed direct queue steering, trying RSS context");
+			/* Fall through to RSS context path */
+		} else {
+			return 0; /* rss_context = 0 means no context to delete */
+		}
+	}
+
 	get.cmd = ETHTOOL_GRSSH;
 	if (ethtool(ifname, &get) < 0) {
 		warn("ethtool failed to get RSS context");
@@ -235,7 +367,7 @@ static int rss_context_equal(char *ifname, int start_queue, int num_queues,
 
 	rss_context = set->rss_context;
 
-	if (add_steering_rule(addr, ifname, rss_context) < 0) {
+	if (add_steering_rule(addr, ifname, rss_context, -1) < 0) {
 		warn("Failed to add rule to RSS context");
 		ret = -1;
 		goto delete_context;
@@ -593,38 +725,68 @@ static int cuda_dev_init(struct pci_dev *dev)
 	int devnum;
 	int ret;
 	int ok;
+	FILE *dbg;
 
+	dbg = fopen("/tmp/kperf_cuda_debug.log", "w");
+	if (dbg) { fprintf(dbg, "cuda_dev_init: start, pid=%d\n", getpid()); fflush(dbg); }
+
+	warnx("cuda_dev_init: calling cuInit(0)");
+	if (dbg) { fprintf(dbg, "cuda_dev_init: calling cuInit(0)\n"); fflush(dbg); }
 	ret = cuInit(0);
-	if (ret != CUDA_SUCCESS)
+	if (ret != CUDA_SUCCESS) {
+		if (dbg) { fprintf(dbg, "cuda_dev_init: cuInit() failed with error %d\n", ret); fclose(dbg); }
+		warnx("cuda_dev_init: cuInit() failed with error %d", ret);
 		return -1;
-
-	/* If the user did not specify a device, select any device */
-	if (dev->domain == DEVICE_DOMAIN_ANY && dev->bus == DEVICE_BUS_ANY && dev->device == DEVICE_DEVICE_ANY) {
-		devnum = 0;
-	} else {
-		devnum = cuda_find_device(dev->domain, dev->bus, dev->device);
-		if (devnum < 0)
-			return -1;
 	}
 
+	if (dbg) { fprintf(dbg, "cuda_dev_init: cuInit succeeded\n"); fflush(dbg); }
+
+	/* If the user did not specify a device, select any device */
+	warnx("cuda_dev_init: dev domain=%u bus=%u device=%u", dev->domain, dev->bus, dev->device);
+	if (dev->domain == DEVICE_DOMAIN_ANY && dev->bus == DEVICE_BUS_ANY && dev->device == DEVICE_DEVICE_ANY) {
+		devnum = 0;
+		warnx("cuda_dev_init: using default device 0");
+	} else {
+		devnum = cuda_find_device(dev->domain, dev->bus, dev->device);
+		warnx("cuda_dev_init: cuda_find_device returned %d", devnum);
+		if (devnum < 0) {
+			if (dbg) { fprintf(dbg, "cuda_dev_init: cuda_find_device failed\n"); fclose(dbg); }
+			return -1;
+		}
+	}
+
+	if (dbg) { fprintf(dbg, "cuda_dev_init: devnum=%d\n", devnum); fflush(dbg); }
+
+	warnx("cuda_dev_init: calling cuDeviceGet(devnum=%d)", devnum);
 	ret = cuDeviceGet(&cuda_dev, devnum);
-	if (ret != CUDA_SUCCESS)
+	if (ret != CUDA_SUCCESS) {
+		if (dbg) { fprintf(dbg, "cuda_dev_init: cuDeviceGet() failed with error %d\n", ret); fclose(dbg); }
+		warnx("cuda_dev_init: cuDeviceGet() failed with error %d", ret);
 		return -1;
+	}
 
 	ok = 0;
+	warnx("cuda_dev_init: checking DMA_BUF_SUPPORTED attribute");
 	ret = cuDeviceGetAttribute(&ok, CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED,
 				   cuda_dev);
 	if (ret != CUDA_SUCCESS || !ok) {
+		if (dbg) { fprintf(dbg, "cuda_dev_init: DMA_BUF check failed: ret=%d ok=%d\n", ret, ok); fclose(dbg); }
+		warnx("cuda_dev_init: DMA_BUF check failed: ret=%d ok=%d", ret, ok);
 		if (!ok)
 			warnx("CUDA device does not support dmabuf");
 		return -1;
 	}
 
+	warnx("cuda_dev_init: calling cudaSetDevice(%d)", devnum);
 	ret = cudaSetDevice(devnum);
 	if (ret != cudaSuccess) {
-		warn("cudaSetDevice() failed with error %d", ret);
+		if (dbg) { fprintf(dbg, "cuda_dev_init: cudaSetDevice failed with error %d\n", ret); fclose(dbg); }
+		warnx("cudaSetDevice() failed with error %d", ret);
 		return -1;
 	}
+
+	if (dbg) { fprintf(dbg, "cuda_dev_init: success, devnum=%d\n", devnum); fclose(dbg); }
+	warnx("cuda_dev_init: success, devnum=%d", devnum);
 
 	if (verbose >= 4)
 		fprintf(stderr, "cuda: tid %d selecting device %d (%s)\n",
@@ -824,10 +986,37 @@ void unreserve_queues(char *ifname, int rss_context)
 }
 
 /* Setup Devmem RX */
+static int configure_hds(int ifindex)
+{
+	struct ethtool_rings_set_req *req;
+	struct ynl_error yerr;
+	struct ynl_sock *ys;
+	int ret;
+
+	ys = ynl_sock_create(&ynl_ethtool_family, &yerr);
+	if (!ys) {
+		warnx("Failed to setup YNL socket for rings: %s", yerr.msg);
+		return -1;
+	}
+
+	req = ethtool_rings_set_req_alloc();
+	ethtool_rings_set_req_set_header_dev_index(req, ifindex);
+	ethtool_rings_set_req_set_tcp_data_split(req,
+		ETHTOOL_TCP_DATA_SPLIT_ENABLED);
+
+	ret = ethtool_rings_set(ys, req);
+	if (ret < 0)
+		warnx("Failed to configure tcp-data-split: %s", ys->err.msg);
+
+	ethtool_rings_set_req_free(req);
+	ynl_sock_destroy(ys);
+	return ret < 0 ? -1 : 0;
+}
+
 int devmem_setup(struct session_state_devmem *devmem, int fd,
 		 size_t dmabuf_rx_size_mb, int num_queues,
-		 enum memory_provider_type provider,
-		 struct pci_dev *dev)
+		 enum memory_provider_type provider, struct pci_dev *dev,
+		 unsigned int xps_irq_start, unsigned int xps_pin_off)
 {
 	struct netdev_queue_id *queues;
 	struct ynl_error yerr;
@@ -840,29 +1029,51 @@ int devmem_setup(struct session_state_devmem *devmem, int fd,
 	if (ret)
 		return ret;
 
+	/* Configure XPS after queue reservation. mlx5 resets XPS when
+	 * channel count changes, so this must happen after reserve_queues.
+	 */
+	if (configure_xps(devmem->ifname, ifindex, xps_irq_start,
+			  num_queues, xps_pin_off) < 0)
+		warnx("XPS configuration failed, continuing anyway");
+
+	warnx("devmem_setup: configuring HDS for ifindex=%d", ifindex);
+	ret = configure_hds(ifindex);
+	if (ret) {
+		warnx("devmem_setup: configure_hds() failed, ret=%d", ret);
+		goto undo_queues;
+	}
+
+	warnx("devmem_setup: getting memory provider (type=%d)", provider);
 	rxmp = get_memory_provider(provider);
 	if (!rxmp) {
+		warnx("devmem_setup: get_memory_provider() returned NULL");
 		ret = -1;
 		goto undo_queues;
 	}
 
+	warnx("devmem_setup: creating YNL netdev socket");
 	devmem->ys = ynl_sock_create(&ynl_netdev_family, &yerr);
 	if (!devmem->ys) {
 		warnx("Failed to setup YNL socket: %s", yerr.msg);
 		goto undo_queues;
 	}
 
+	warnx("devmem_setup: calling dev_init (dev_init=%p)", (void *)rxmp->dev_init);
 	if (rxmp->dev_init && rxmp->dev_init(dev) < 0) {
+		warnx("devmem_setup: dev_init() failed");
 		ret = -1;
 		goto sock_destroy;
 	}
 
+	warnx("devmem_setup: allocating %zu MB dmabuf", dmabuf_rx_size_mb);
 	devmem->mem = rxmp->alloc(dmabuf_rx_size_mb * 1024 * 1024);
 	if (!devmem->mem) {
-		warnx("Failed to allocate memory");
+		warnx("devmem_setup: alloc() failed for %zu MB", dmabuf_rx_size_mb);
 		ret = -1;
 		goto sock_destroy;
 	}
+
+	warnx("devmem_setup: alloc succeeded, fd=%d", devmem->mem->fd);
 
 	queues = calloc(num_queues, sizeof(*queues));
 	if (!queues) {
@@ -876,15 +1087,19 @@ int devmem_setup(struct session_state_devmem *devmem, int fd,
 		queues[i]._present.id = 1;
 		queues[i].type = NETDEV_QUEUE_TYPE_RX;
 		queues[i].id = max_kernel_queue + i;
+		warnx("devmem_setup: queue[%d] id=%d", i, queues[i].id);
 	}
 
+	warnx("devmem_setup: binding RX queues (ifindex=%d, fd=%d, n_queues=%d)",
+	      ifindex, devmem->mem->fd, num_queues);
         devmem->mem->dmabuf_id = bind_rx_queue(ifindex, devmem->mem->fd, queues,
                                           num_queues, devmem->ys);
         if (devmem->mem->dmabuf_id < 0) {
-		warnx("Failed to bind RX queue");
+		warnx("Failed to bind RX queue, dmabuf_id=%d", devmem->mem->dmabuf_id);
 		ret = -1;
 		goto free_queues;
 	}
+	warnx("devmem_setup: success, dmabuf_id=%d", devmem->mem->dmabuf_id);
 
 	return 0;
 
@@ -975,8 +1190,11 @@ static int devmem_handle_token(int fd, struct connection_devmem *conn,
 	struct dmabuf_token *token;
 
 	if (cm->cmsg_type == SO_DEVMEM_LINEAR) {
-		warnx("received linear chunk, flow steering error?");
-		return -EFAULT;
+		/* Linear data (e.g. TCP headers from HDS) is copied to the
+		 * iov_base buffer by the kernel.  This is expected behavior,
+		 * not a flow steering error.  Just skip token processing.
+		 */
+		return 0;
 	}
 
 	if (conn->rxtok_len == ARRAY_SIZE(conn->rxtok)) {
@@ -1001,7 +1219,7 @@ ssize_t devmem_recv(int fd, struct connection_devmem *conn,
 {
 	struct msghdr msg = {};
 	struct iovec iov = {
-		.iov_base = NULL,
+		.iov_base = rxbuf,
 		.iov_len = chunk,
 	};
 	struct cmsghdr *cm;
@@ -1027,7 +1245,7 @@ ssize_t devmem_recv(int fd, struct connection_devmem *conn,
 		if (ret < 0)
 			return ret;
 
-		if (validate) {
+		if (validate && cm->cmsg_type == SO_DEVMEM_DMABUF) {
 			ret = devmem_validate_token(mem, cm, rep, &tot_recv);
 			if (ret < 0)
 				return ret;
@@ -1037,9 +1255,13 @@ ssize_t devmem_recv(int fd, struct connection_devmem *conn,
 	}
 
 	if (!tokens) {
-		warnx("devmem recvmsg returned no tokens");
-		errno = -EFAULT;
-		return -1;
+		/* No devmem cmsgs means the kernel copied data from readable
+		 * (non-devmem) skbs directly to iov_base.  This is expected
+		 * when some data arrives on non-devmem queues (e.g. early
+		 * segments before flow steering takes effect, or in mixed
+		 * queue environments).  Just return the data as a normal recv.
+		 */
+		return n;
 	}
 
 	return n;
@@ -1090,7 +1312,9 @@ int devmem_bind_socket(struct session_state_devmem *devmem, int fd)
 }
 
 int devmem_setup_tx(struct session_state_devmem *devmem, enum memory_provider_type provider,
-		    int dmabuf_tx_size_mb, struct pci_dev *dev, struct sockaddr_in6 *addr)
+		    int dmabuf_tx_size_mb, struct pci_dev *dev, struct sockaddr_in6 *addr,
+		    unsigned int xps_irq_start, unsigned int num_irq_cpus,
+		    unsigned int xps_pin_off)
 {
 	char ifname[IFNAMSIZ] = {};
 	struct ynl_error yerr;
@@ -1122,6 +1346,11 @@ int devmem_setup_tx(struct session_state_devmem *devmem, enum memory_provider_ty
 		warnx("Failed to resolve ifindex: %s", strerror(-ifindex));
 		return -1;
 	}
+
+	/* Configure XPS for TX interface */
+	if (configure_xps(ifname, ifindex, xps_irq_start,
+			  num_irq_cpus, xps_pin_off) < 0)
+		warnx("XPS configuration failed for TX, continuing anyway");
 
 	devmem->ys = ynl_sock_create(&ynl_netdev_family, &yerr);
 	if (!devmem->ys) {

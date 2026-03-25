@@ -57,7 +57,7 @@ static struct {
 	int cpu_dst_wrk;
 	unsigned int mss;
 	unsigned int n_conns;
-	unsigned int max_pace;
+	unsigned long max_pace;
 	char *tcp_cong_ctrl;
 	unsigned int dmabuf_rx_size_mb;
 	unsigned int dmabuf_tx_size_mb;
@@ -67,6 +67,8 @@ static struct {
 	bool iou_dst;
 	bool zerocopy_rx;
 	unsigned int iou_rx_size_mb;
+	unsigned int xps_src_irq_start;
+	unsigned int xps_dst_irq_start;
 } opt = {
 	.tls_ver = TLS_1_3_VERSION,
 	.src = "localhost",
@@ -228,7 +230,7 @@ static const struct opt_table opts[] = {
 		     "Time stats - (0) none, (1) hist, (2) hist+pstats"),
 	OPT_WITH_ARG("--mss|-M <arg>", opt_set_uintval, opt_show_uintval,
 		     &opt.mss, "MSS for TCP"),
-	OPT_WITH_ARG("--max-pace <arg>", opt_set_uintval, opt_show_uintval,
+	OPT_WITH_ARG("--max-pace <arg>", opt_set_ulongval, opt_show_ulongval,
 		     &opt.max_pace, "Max sending/pacing rate"),
 	OPT_WITHOUT_ARG("--tls", opt_set_bool, &opt.tls,
 			"Enable TLS in both directions"),
@@ -285,6 +287,10 @@ static const struct opt_table opts[] = {
 			      "Use zero copy on receive"),
 	OPT_WITH_ARG("--iou-rx-size-mb <arg>", opt_set_uintval, opt_show_uintval,
 		     &opt.iou_rx_size_mb, "Size of RX memory reserved by io_uring"),
+	OPT_WITH_ARG("--xps-src-irq-start <arg>", opt_set_uintval, opt_show_uintval,
+		     &opt.xps_src_irq_start, "Source IRQ CPU start for XPS pairing"),
+	OPT_WITH_ARG("--xps-dst-irq-start <arg>", opt_set_uintval, opt_show_uintval,
+		     &opt.xps_dst_irq_start, "Destination IRQ CPU start for XPS pairing"),
 	OPT_ENDTABLE
 };
 
@@ -840,6 +846,8 @@ int main(int argc, char *argv[])
 		.validate = opt.validate,
 		.iou = opt.iou_dst,
 		.iou_rx_size_mb = opt.iou_rx_size_mb,
+		.xps_pin_off = opt.pin_off,
+		.xps_irq_start = opt.xps_dst_irq_start,
 	};
 	if (kpm_req_mode(dst, &dst_mode) < 0) {
 		warnx("Failed setup destination mode");
@@ -859,6 +867,8 @@ int main(int argc, char *argv[])
 		.validate = opt.validate,
 		.iou = opt.iou_src,
 		.iou_rx_size_mb = opt.iou_rx_size_mb,
+		.xps_pin_off = opt.pin_off,
+		.xps_irq_start = opt.xps_src_irq_start,
 	};
 	if (kpm_req_mode(src, &src_mode) < 0) {
 		warnx("Failed setup source mode");

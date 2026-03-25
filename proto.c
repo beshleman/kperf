@@ -160,7 +160,7 @@ kpm_send_tls(int fd, __u32 conn_id, __u32 dir_mask, void *info, socklen_t len)
 	return kpm_send(fd, &msg.hdr, sizeof(msg), KPM_MSG_TYPE_TLS);
 }
 
-int kpm_send_max_pacing(int fd, __u32 id, __u32 pace)
+int kpm_send_max_pacing(int fd, __u32 id, __u64 pace)
 {
 	struct kpm_max_pacing msg;
 
@@ -393,7 +393,7 @@ kpm_req_tls(int fd, __u32 conn_id, __u32 dir_mask, void *info, socklen_t len)
 }
 
 int
-kpm_req_pacing(int fd, __u32 conn_id, __u32 max_pace)
+kpm_req_pacing(int fd, __u32 conn_id, __u64 max_pace)
 {
 	struct kpm_empty *repl;
 	int id;

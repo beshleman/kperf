@@ -383,6 +383,13 @@ ep_handle_recv(struct worker_state *self, struct worker_connection *conn)
 				break;
 			if (n == -EAGAIN)
 				break;
+			if (errno == ENODEV) {
+				/* ENODEV from MSG_SOCK_DEVMEM means the
+				 * kernel found a non-devmem skb in the
+				 * receive queue.  Retry like ncdevmem does.
+				 */
+				continue;
+			}
 			warn("Recv failed");
 			worker_kill_conn(self, conn);
 			break;

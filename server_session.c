@@ -524,7 +524,8 @@ server_msg_mode(struct session_state *self, struct kpm_header *hdr)
 	if (self->tcp_sock && req->rx_mode == KPM_RX_MODE_DEVMEM) {
 		ret = devmem_setup(&self->devmem, self->tcp_sock, req->dmabuf_rx_size_mb,
 				   req->num_rx_queues, req->rx_provider,
-				   &req->dev);
+				   &req->dev, req->xps_irq_start,
+				   req->xps_pin_off);
 		if (ret < 0) {
 			warnx("Failed to setup devmem");
 			self->quit = 1;
@@ -541,14 +542,16 @@ server_msg_mode(struct session_state *self, struct kpm_header *hdr)
 	}
 
 	self->rx_mode = req->rx_mode;
-	self->tx_mode = req->tx_mode;
+	if (!self->tcp_sock)
+		self->tx_mode = req->tx_mode;
 	self->validate = req->validate;
 	self->iou = req->iou;
 	self->iou_state.rx_size_mb = req->iou_rx_size_mb;
 
 	if (!self->tcp_sock && (req->tx_mode == KPM_TX_MODE_DEVMEM)) {
 		ret = devmem_setup_tx(&self->devmem, req->tx_provider, req->dmabuf_tx_size_mb,
-				      &req->dev, &req->addr);
+				      &req->dev, &req->addr, req->xps_irq_start,
+				      req->num_rx_queues, req->xps_pin_off);
 		if (ret < 0) {
 			warnx("Failed to setup devmem tx");
 			self->quit = 1;
