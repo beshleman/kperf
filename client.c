@@ -7,6 +7,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <arpa/inet.h>
+#include <sys/select.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 
@@ -69,6 +70,15 @@ static struct {
 	unsigned int iou_rx_size_mb;
 	unsigned int xps_src_irq_start;
 	unsigned int xps_dst_irq_start;
+	bool bidirectional;
+	unsigned int src_queue_start;
+	unsigned int dst_queue_start;
+	unsigned int src_ack_queue_start;
+	unsigned int dst_ack_queue_start;
+	unsigned int src_local_port_start;
+	unsigned int dst_local_port_start;
+	unsigned int src_listen_port;
+	unsigned int dst_listen_port;
 } opt = {
 	.tls_ver = TLS_1_3_VERSION,
 	.src = "localhost",
@@ -291,6 +301,24 @@ static const struct opt_table opts[] = {
 		     &opt.xps_src_irq_start, "Source IRQ CPU start for XPS pairing"),
 	OPT_WITH_ARG("--xps-dst-irq-start <arg>", opt_set_uintval, opt_show_uintval,
 		     &opt.xps_dst_irq_start, "Destination IRQ CPU start for XPS pairing"),
+	OPT_WITHOUT_ARG("--bidirectional", opt_set_bool, &opt.bidirectional,
+			"Enable bidirectional mode"),
+	OPT_WITH_ARG("--src-queue-start <arg>", opt_set_uintval, opt_show_uintval,
+		     &opt.src_queue_start, "Source RX data queue start"),
+	OPT_WITH_ARG("--dst-queue-start <arg>", opt_set_uintval, opt_show_uintval,
+		     &opt.dst_queue_start, "Destination RX data queue start"),
+	OPT_WITH_ARG("--src-ack-queue-start <arg>", opt_set_uintval, opt_show_uintval,
+		     &opt.src_ack_queue_start, "Source TX ACK queue start"),
+	OPT_WITH_ARG("--dst-ack-queue-start <arg>", opt_set_uintval, opt_show_uintval,
+		     &opt.dst_ack_queue_start, "Destination TX ACK queue start"),
+	OPT_WITH_ARG("--src-local-port-start <arg>", opt_set_uintval, opt_show_uintval,
+		     &opt.src_local_port_start, "Source local port start for TX bind"),
+	OPT_WITH_ARG("--dst-local-port-start <arg>", opt_set_uintval, opt_show_uintval,
+		     &opt.dst_local_port_start, "Destination local port start for TX bind"),
+	OPT_WITH_ARG("--src-listen-port <arg>", opt_set_uintval, opt_show_uintval,
+		     &opt.src_listen_port, "Source listen port for acceptor"),
+	OPT_WITH_ARG("--dst-listen-port <arg>", opt_set_uintval, opt_show_uintval,
+		     &opt.dst_listen_port, "Destination listen port for acceptor"),
 	OPT_ENDTABLE
 };
 
@@ -714,6 +742,391 @@ int inet_sockaddr(const char *str, struct sockaddr_in6 *out)
 	return -1;
 }
 
+static int install_steering_rule(int server_fd, const char *ifname,
+				 struct sockaddr_in6 *addr, __u16 port,
+				 int queue_id, bool match_is_dst,
+				 __s32 *out_rule_loc)
+{
+	struct kpm_steering_rule rule = {};
+
+	memcpy(&rule.addr, addr, sizeof(rule.addr));
+	rule.port = port;
+	rule.match_is_dst = match_is_dst ? 1 : 0;
+	rule.action = 0; /* add */
+	rule.queue_id = queue_id;
+	strncpy(rule.ifname, ifname, sizeof(rule.ifname) - 1);
+
+	return kpm_req_steering_rule(server_fd, &rule, out_rule_loc);
+}
+
+static int remove_steering_rule(int server_fd, const char *ifname,
+				__s32 rule_loc)
+{
+	struct kpm_steering_rule rule = {};
+
+	rule.action = 1; /* delete */
+	rule.rule_loc = rule_loc;
+	strncpy(rule.ifname, ifname, sizeof(rule.ifname) - 1);
+
+	return kpm_req_steering_rule(server_fd, &rule, NULL);
+}
+
+/*
+ * Bidirectional mode: single client orchestrates flows in both directions.
+ *
+ * Forward direction: src -> dst (src sends, dst receives)
+ * Reverse direction: dst -> src (dst sends, src receives)
+ *
+ * On each host we set up:
+ *   - RX data queues for incoming data
+ *   - ACK queues for ACKs of outgoing data
+ *   - Workers pinned at SO_INCOMING_CPU + pin_off
+ */
+static int run_bidirectional(int src, int dst,
+			     unsigned int src_ncpus, unsigned int dst_ncpus)
+{
+	struct kpm_connect_reply *fwd_conns = NULL, *rev_conns = NULL;
+	__u32 *fwd_src_wrk_id, *fwd_dst_wrk_id;
+	__u32 *rev_src_wrk_id, *rev_dst_wrk_id;
+	struct sockaddr_in6 fwd_conn_addr, rev_conn_addr;
+	struct kpm_test_results *result;
+	struct kpm_test *test;
+	__u32 fwd_src_tst_id, fwd_dst_tst_id;
+	__u32 rev_src_tst_id, rev_dst_tst_id;
+	socklen_t len;
+	unsigned int i;
+	size_t sz;
+	int seq;
+	struct sockaddr_in6 src_addr = {};
+	int ret = -1;
+
+	if (inet_sockaddr(opt.src, &src_addr) < 0) {
+		warnx("failed to get sockaddr from %s", opt.src);
+		return -1;
+	}
+
+	fwd_src_wrk_id = calloc(opt.n_conns, sizeof(__u32));
+	fwd_dst_wrk_id = calloc(opt.n_conns, sizeof(__u32));
+	rev_src_wrk_id = calloc(opt.n_conns, sizeof(__u32));
+	rev_dst_wrk_id = calloc(opt.n_conns, sizeof(__u32));
+
+	/* Phase 1: NIC Setup - configure modes on both hosts */
+	struct kpm_mode dst_mode = {
+		.rx_mode = opt.devmem_rx ? KPM_RX_MODE_DEVMEM : KPM_RX_MODE_SOCKET,
+		.tx_mode = opt.devmem_tx ? KPM_TX_MODE_DEVMEM : KPM_TX_MODE_SOCKET,
+		.rx_provider = opt.devmem_rx_memory,
+		.tx_provider = opt.devmem_tx_memory,
+		.dev = opt.devmem_dst_dev,
+		.dmabuf_rx_size_mb = opt.dmabuf_rx_size_mb,
+		.dmabuf_tx_size_mb = opt.dmabuf_tx_size_mb,
+		.num_rx_queues = opt.num_rx_queues,
+		.validate = opt.validate,
+		.iou = opt.iou_dst,
+		.iou_rx_size_mb = opt.iou_rx_size_mb,
+		.xps_pin_off = opt.pin_off,
+		.xps_irq_start = opt.xps_dst_irq_start,
+	};
+
+	struct kpm_mode src_mode = {
+		.rx_mode = opt.devmem_rx ? KPM_RX_MODE_DEVMEM : KPM_RX_MODE_SOCKET,
+		.tx_mode = opt.devmem_tx ? KPM_TX_MODE_DEVMEM : KPM_TX_MODE_SOCKET,
+		.rx_provider = opt.devmem_rx_memory,
+		.tx_provider = opt.devmem_tx_memory,
+		.dev = opt.devmem_src_dev,
+		.dmabuf_rx_size_mb = opt.dmabuf_rx_size_mb,
+		.dmabuf_tx_size_mb = opt.dmabuf_tx_size_mb,
+		.num_rx_queues = opt.num_rx_queues,
+		.addr = src_addr,
+		.validate = opt.validate,
+		.iou = opt.iou_src,
+		.iou_rx_size_mb = opt.iou_rx_size_mb,
+		.xps_pin_off = opt.pin_off,
+		.xps_irq_start = opt.xps_src_irq_start,
+	};
+
+	/* Phase 2: Open acceptors on both hosts */
+	/* Forward: dst accepts connections from src */
+	if (opt.dst_listen_port) {
+		len = sizeof(fwd_conn_addr);
+		if (kpm_req_tcp_sock_ex(dst, opt.dst_listen_port,
+					&fwd_conn_addr, &len) < 0) {
+			warnx("Failed to create forward TCP acceptor");
+			goto out;
+		}
+	} else {
+		len = sizeof(fwd_conn_addr);
+		if (kpm_req_tcp_sock(dst, &fwd_conn_addr, &len) < 0) {
+			warnx("Failed to create forward TCP acceptor");
+			goto out;
+		}
+	}
+
+	/* Reverse: src accepts connections from dst */
+	if (opt.src_listen_port) {
+		len = sizeof(rev_conn_addr);
+		if (kpm_req_tcp_sock_ex(src, opt.src_listen_port,
+					&rev_conn_addr, &len) < 0) {
+			warnx("Failed to create reverse TCP acceptor");
+			goto out;
+		}
+	} else {
+		len = sizeof(rev_conn_addr);
+		if (kpm_req_tcp_sock(src, &rev_conn_addr, &len) < 0) {
+			warnx("Failed to create reverse TCP acceptor");
+			goto out;
+		}
+	}
+
+	/* Set up modes after acceptors so devmem can bind to the tcp_sock */
+	if (kpm_req_mode(dst, &dst_mode) < 0) {
+		warnx("Failed to setup dst mode");
+		goto out;
+	}
+	if (kpm_req_mode(src, &src_mode) < 0) {
+		warnx("Failed to setup src mode");
+		goto out;
+	}
+
+	/* Phase 3: Establish connections in both directions */
+	warnx("Establishing forward connections (src -> dst)...");
+	fwd_conns = spawn_conn(src, dst, &fwd_conn_addr, len);
+	if (!fwd_conns) {
+		warnx("Failed to establish forward connections");
+		goto out;
+	}
+
+	warnx("Establishing reverse connections (dst -> src)...");
+	rev_conns = spawn_conn(dst, src, &rev_conn_addr, len);
+	if (!rev_conns) {
+		warnx("Failed to establish reverse connections");
+		goto out;
+	}
+
+	/* Phase 4: Spawn and pin workers for both directions */
+	for (i = 0; i < opt.n_conns; i++) {
+		/* Forward: src sends, pin src worker on src */
+		__u32 fwd_src_cpu = fwd_conns[i].local.cpu + opt.pin_off;
+		/* Forward: dst receives, pin dst worker on dst */
+		__u32 fwd_dst_cpu = fwd_conns[i].remote.cpu + opt.pin_off;
+		/* Reverse: dst sends, pin dst worker on dst */
+		__u32 rev_src_cpu = rev_conns[i].local.cpu + opt.pin_off;
+		/* Reverse: src receives, pin src worker on src */
+		__u32 rev_dst_cpu = rev_conns[i].remote.cpu + opt.pin_off;
+
+		if (spawn_worker(src, fwd_src_cpu, &fwd_src_wrk_id[i]) ||
+		    spawn_worker(dst, fwd_dst_cpu, &fwd_dst_wrk_id[i]) ||
+		    spawn_worker(dst, rev_src_cpu, &rev_src_wrk_id[i]) ||
+		    spawn_worker(src, rev_dst_cpu, &rev_dst_wrk_id[i]))
+			goto out_conns;
+	}
+
+	/* Phase 5: Start tests in both directions simultaneously */
+	sz = sizeof(*test) + opt.n_conns * sizeof(test->specs[0]);
+	test = calloc(1, sz);
+	test->n_conns = opt.n_conns;
+	test->time_sec = opt.time;
+
+	/* Forward direction: dst passive test (receives) */
+	for (i = 0; i < opt.n_conns; i++) {
+		test->specs[i].connection_id = fwd_conns[i].remote.id;
+		test->specs[i].worker_id = fwd_dst_wrk_id[i];
+		test->specs[i].type = KPM_TEST_TYPE_STREAM;
+		test->specs[i].read_size = opt.read_size;
+		test->specs[i].write_size = opt.write_size;
+	}
+	test->active = 0;
+	seq = kpm_send(dst, &test->hdr, sz, KPM_MSG_TYPE_TEST);
+	{
+		struct __kpm_generic_u32 *ack = kpm_receive(dst);
+		if (!kpm_good_reply(ack, KPM_MSG_TYPE_TEST, seq)) {
+			warnx("Bad ack for fwd dst test");
+			free(ack);
+			free(test);
+			goto out_conns;
+		}
+		fwd_dst_tst_id = ack->val;
+		free(ack);
+	}
+
+	/* Reverse direction: src passive test (receives) */
+	for (i = 0; i < opt.n_conns; i++) {
+		test->specs[i].connection_id = rev_conns[i].remote.id;
+		test->specs[i].worker_id = rev_dst_wrk_id[i];
+	}
+	test->active = 0;
+	seq = kpm_send(src, &test->hdr, sz, KPM_MSG_TYPE_TEST);
+	{
+		struct __kpm_generic_u32 *ack = kpm_receive(src);
+		if (!kpm_good_reply(ack, KPM_MSG_TYPE_TEST, seq)) {
+			warnx("Bad ack for rev src test");
+			free(ack);
+			free(test);
+			goto out_conns;
+		}
+		rev_dst_tst_id = ack->val;
+		free(ack);
+	}
+
+	/* Forward direction: src active test (sends) */
+	for (i = 0; i < opt.n_conns; i++) {
+		test->specs[i].connection_id = fwd_conns[i].local.id;
+		test->specs[i].worker_id = fwd_src_wrk_id[i];
+	}
+	test->active = 1;
+	seq = kpm_send(src, &test->hdr, sz, KPM_MSG_TYPE_TEST);
+	{
+		struct __kpm_generic_u32 *ack = kpm_receive(src);
+		if (!kpm_good_reply(ack, KPM_MSG_TYPE_TEST, seq)) {
+			warnx("Bad ack for fwd src test");
+			free(ack);
+			free(test);
+			goto out_conns;
+		}
+		fwd_src_tst_id = ack->val;
+		free(ack);
+	}
+
+	/* Reverse direction: dst active test (sends) */
+	for (i = 0; i < opt.n_conns; i++) {
+		test->specs[i].connection_id = rev_conns[i].local.id;
+		test->specs[i].worker_id = rev_src_wrk_id[i];
+	}
+	test->active = 1;
+	seq = kpm_send(dst, &test->hdr, sz, KPM_MSG_TYPE_TEST);
+	{
+		struct __kpm_generic_u32 *ack = kpm_receive(dst);
+		if (!kpm_good_reply(ack, KPM_MSG_TYPE_TEST, seq)) {
+			warnx("Bad ack for rev dst test");
+			free(ack);
+			free(test);
+			goto out_conns;
+		}
+		rev_src_tst_id = ack->val;
+		free(ack);
+	}
+	free(test);
+
+	/*
+	 * Collect results from both sockets. Each socket carries results
+	 * for two tests (active + passive), so we need to dispatch by
+	 * test_id rather than assuming ordering.
+	 *
+	 * src socket: fwd_src (active, sends) + rev_dst (passive, receives)
+	 * dst socket: rev_src (active, sends) + fwd_dst (passive, receives)
+	 *
+	 * Active tests finish first (they drive the timer), then we
+	 * end_test the passive side and collect those results.
+	 */
+	{
+		int results_collected = 0;
+
+		/* Collect 2 active results (one from each socket) */
+		warnx("Waiting for results...");
+		while (results_collected < 2) {
+			fd_set fds;
+			FD_ZERO(&fds);
+			FD_SET(src, &fds);
+			FD_SET(dst, &fds);
+			int maxfd = src > dst ? src : dst;
+
+			if (select(maxfd + 1, &fds, NULL, NULL, NULL) < 0) {
+				warn("select");
+				break;
+			}
+
+			if (FD_ISSET(src, &fds)) {
+				result = kpm_receive(src);
+				if (result && result->hdr.type == KPM_MSG_TYPE_TEST_RESULT) {
+					if (result->test_id == fwd_src_tst_id) {
+						dump_result(result, "Forward Source (TX)",
+							    fwd_conns, true);
+					} else {
+						dump_result(result, "Reverse Target (RX)",
+							    rev_conns, false);
+					}
+					results_collected++;
+					free(result);
+				}
+			}
+			if (FD_ISSET(dst, &fds)) {
+				result = kpm_receive(dst);
+				if (result && result->hdr.type == KPM_MSG_TYPE_TEST_RESULT) {
+					if (result->test_id == rev_src_tst_id) {
+						dump_result(result, "Reverse Source (TX)",
+							    rev_conns, true);
+					} else {
+						dump_result(result, "Forward Target (RX)",
+							    fwd_conns, false);
+					}
+					results_collected++;
+					free(result);
+				}
+			}
+		}
+
+		/* Stop all tests */
+		kpm_req_end_test(src, fwd_src_tst_id);
+		kpm_req_end_test(dst, fwd_dst_tst_id);
+		kpm_req_end_test(dst, rev_src_tst_id);
+		kpm_req_end_test(src, rev_dst_tst_id);
+
+		/* Collect 2 passive results */
+		while (results_collected < 4) {
+			fd_set fds;
+			FD_ZERO(&fds);
+			FD_SET(src, &fds);
+			FD_SET(dst, &fds);
+			int maxfd = src > dst ? src : dst;
+
+			if (select(maxfd + 1, &fds, NULL, NULL, NULL) < 0) {
+				warn("select");
+				break;
+			}
+
+			if (FD_ISSET(src, &fds)) {
+				result = kpm_receive(src);
+				if (result && result->hdr.type == KPM_MSG_TYPE_TEST_RESULT) {
+					if (result->test_id == fwd_src_tst_id) {
+						dump_result(result, "Forward Source (TX)",
+							    fwd_conns, true);
+					} else {
+						dump_result(result, "Reverse Target (RX)",
+							    rev_conns, false);
+					}
+					results_collected++;
+					free(result);
+				}
+			}
+			if (FD_ISSET(dst, &fds)) {
+				result = kpm_receive(dst);
+				if (result && result->hdr.type == KPM_MSG_TYPE_TEST_RESULT) {
+					if (result->test_id == rev_src_tst_id) {
+						dump_result(result, "Reverse Source (TX)",
+							    rev_conns, true);
+					} else {
+						dump_result(result, "Forward Target (RX)",
+							    fwd_conns, false);
+					}
+					results_collected++;
+					free(result);
+				}
+			}
+		}
+	}
+
+	ret = 0;
+
+out_conns:
+	free(fwd_conns);
+	free(rev_conns);
+out:
+	free(fwd_src_wrk_id);
+	free(fwd_dst_wrk_id);
+	free(rev_src_wrk_id);
+	free(rev_dst_wrk_id);
+	return ret;
+}
+
 int main(int argc, char *argv[])
 {
 	enum kpm_rx_mode rx_mode = KPM_RX_MODE_SOCKET;
@@ -733,7 +1146,7 @@ int main(int argc, char *argv[])
 	socklen_t len;
 	int src, dst;
 	size_t sz;
-	int seq;
+	int seq, ret;
 
 	opt_register_table(opts, NULL);
 
@@ -826,6 +1239,13 @@ int main(int argc, char *argv[])
 
 	if (kpm_xchg_hello(dst, &dst_ncpus))
 		errx(2, "Bad hello");
+
+	if (opt.bidirectional) {
+		ret = run_bidirectional(src, dst, src_ncpus, dst_ncpus);
+		close(src);
+		close(dst);
+		return ret;
+	}
 
 	/* Main */
 	len = sizeof(conn_addr);

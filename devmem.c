@@ -43,8 +43,6 @@
 
 extern unsigned char patbuf[KPM_MAX_OP_CHUNK + PATTERN_PERIOD + 1];
 
-static int steering_rule_loc = -1;
-
 static int configure_xps(const char *ifname, int ifindex,
 			 unsigned int irq_start, unsigned int num_irq_cpus,
 			 unsigned int pin_off)
@@ -171,19 +169,34 @@ static int ethtool(const char *ifname, void *data)
 	return ret;
 }
 
+static int legacy_steering_rule_loc = -1;
+
 static void reset_flow_steering(const char *ifname)
 {
 	struct ethtool_rxnfc del;
 
-	if (steering_rule_loc < 0)
+	if (legacy_steering_rule_loc < 0)
 		return;
 
 	del.cmd = ETHTOOL_SRXCLSRLDEL;
-	del.fs.location = steering_rule_loc;
+	del.fs.location = legacy_steering_rule_loc;
 
 	ethtool(ifname, &del);
 
-	steering_rule_loc = -1;
+	legacy_steering_rule_loc = -1;
+}
+
+int devmem_del_steering_rule(const char *ifname, int rule_loc)
+{
+	struct ethtool_rxnfc del = {};
+
+	if (rule_loc < 0)
+		return -1;
+
+	del.cmd = ETHTOOL_SRXCLSRLDEL;
+	del.fs.location = rule_loc;
+
+	return ethtool(ifname, &del);
 }
 
 static int find_free_rule_loc(const char *ifname, int rule_cnt)
@@ -225,9 +238,10 @@ free_rules:
 	return -1;
 }
 
-static int add_steering_rule(struct sockaddr_in6 *server_sin,
-			     const char *ifname, int rss_context,
-			     int direct_queue)
+static int __add_steering_rule(struct sockaddr_in6 *sin,
+			       const char *ifname, int rss_context,
+			       int direct_queue, bool match_is_dst,
+			       __s32 *out_rule_loc)
 {
 	struct ethtool_rxnfc add = {};
 	struct ethtool_rxnfc cnt = {};
@@ -236,35 +250,52 @@ static int add_steering_rule(struct sockaddr_in6 *server_sin,
 	add.cmd = ETHTOOL_SRXCLSRLINS;
 
 	if (direct_queue >= 0) {
-		/* Direct to specific queue (like ncdevmem) */
 		add.fs.ring_cookie = direct_queue;
 		add.rss_context = 0;
 	} else {
-		/* RSS context mode */
 		add.rss_context = rss_context;
 	}
 
-	if (IN6_IS_ADDR_V4MAPPED(&server_sin->sin6_addr)) {
+	if (IN6_IS_ADDR_V4MAPPED(&sin->sin6_addr)) {
 		add.fs.flow_type = TCP_V4_FLOW;
-                memcpy(&add.fs.h_u.tcp_ip4_spec.ip4dst,
-                       &server_sin->sin6_addr.s6_addr32[3], 4);
-                memcpy(&add.fs.h_u.tcp_ip4_spec.pdst,
-		       &server_sin->sin6_port, 2);
-
-		add.fs.m_u.tcp_ip4_spec.ip4dst = 0xffffffff;
-		add.fs.m_u.tcp_ip4_spec.pdst = 0xffff;
+		if (match_is_dst) {
+			memcpy(&add.fs.h_u.tcp_ip4_spec.ip4dst,
+			       &sin->sin6_addr.s6_addr32[3], 4);
+			memcpy(&add.fs.h_u.tcp_ip4_spec.pdst,
+			       &sin->sin6_port, 2);
+			add.fs.m_u.tcp_ip4_spec.ip4dst = 0xffffffff;
+			add.fs.m_u.tcp_ip4_spec.pdst = 0xffff;
+		} else {
+			memcpy(&add.fs.h_u.tcp_ip4_spec.ip4src,
+			       &sin->sin6_addr.s6_addr32[3], 4);
+			memcpy(&add.fs.h_u.tcp_ip4_spec.psrc,
+			       &sin->sin6_port, 2);
+			add.fs.m_u.tcp_ip4_spec.ip4src = 0xffffffff;
+			add.fs.m_u.tcp_ip4_spec.psrc = 0xffff;
+		}
 	} else {
 		add.fs.flow_type = TCP_V6_FLOW;
-                memcpy(add.fs.h_u.tcp_ip6_spec.ip6dst, &server_sin->sin6_addr,
-                       16);
-                memcpy(&add.fs.h_u.tcp_ip6_spec.pdst, &server_sin->sin6_port,
-                       2);
-
-                add.fs.m_u.tcp_ip6_spec.ip6dst[0] = 0xffffffff;
-		add.fs.m_u.tcp_ip6_spec.ip6dst[1] = 0xffffffff;
-		add.fs.m_u.tcp_ip6_spec.ip6dst[2] = 0xffffffff;
-		add.fs.m_u.tcp_ip6_spec.ip6dst[3] = 0xffffffff;
-		add.fs.m_u.tcp_ip6_spec.pdst = 0xffff;
+		if (match_is_dst) {
+			memcpy(add.fs.h_u.tcp_ip6_spec.ip6dst,
+			       &sin->sin6_addr, 16);
+			memcpy(&add.fs.h_u.tcp_ip6_spec.pdst,
+			       &sin->sin6_port, 2);
+			add.fs.m_u.tcp_ip6_spec.ip6dst[0] = 0xffffffff;
+			add.fs.m_u.tcp_ip6_spec.ip6dst[1] = 0xffffffff;
+			add.fs.m_u.tcp_ip6_spec.ip6dst[2] = 0xffffffff;
+			add.fs.m_u.tcp_ip6_spec.ip6dst[3] = 0xffffffff;
+			add.fs.m_u.tcp_ip6_spec.pdst = 0xffff;
+		} else {
+			memcpy(add.fs.h_u.tcp_ip6_spec.ip6src,
+			       &sin->sin6_addr, 16);
+			memcpy(&add.fs.h_u.tcp_ip6_spec.psrc,
+			       &sin->sin6_port, 2);
+			add.fs.m_u.tcp_ip6_spec.ip6src[0] = 0xffffffff;
+			add.fs.m_u.tcp_ip6_spec.ip6src[1] = 0xffffffff;
+			add.fs.m_u.tcp_ip6_spec.ip6src[2] = 0xffffffff;
+			add.fs.m_u.tcp_ip6_spec.ip6src[3] = 0xffffffff;
+			add.fs.m_u.tcp_ip6_spec.psrc = 0xffff;
+		}
 	}
 
 	if (direct_queue < 0)
@@ -290,9 +321,30 @@ static int add_steering_rule(struct sockaddr_in6 *server_sin,
 	if (ret)
 		return ret;
 
-	steering_rule_loc = add.fs.location;
+	if (out_rule_loc)
+		*out_rule_loc = add.fs.location;
 
 	return 0;
+}
+
+static int add_steering_rule(struct sockaddr_in6 *server_sin,
+			     const char *ifname, int rss_context,
+			     int direct_queue)
+{
+	return __add_steering_rule(server_sin, ifname, rss_context,
+				  direct_queue, true, &legacy_steering_rule_loc);
+}
+
+int devmem_add_steering_rule(struct sockaddr_in6 *addr, __u16 port,
+			     const char *ifname, int queue_id,
+			     bool match_is_dst, __s32 *out_rule_loc)
+{
+	struct sockaddr_in6 sin = *addr;
+
+	sin.sin6_port = port;
+
+	return __add_steering_rule(&sin, ifname, 0, queue_id,
+				   match_is_dst, out_rule_loc);
 }
 
 static int rss_context_delete(char *ifname, int rss_context)

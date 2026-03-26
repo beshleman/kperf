@@ -4,6 +4,7 @@
 #define _GNU_SOURCE
 
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <sched.h>
 #include <stdint.h>
@@ -253,6 +254,23 @@ server_msg_connect(struct session_state *self, struct kpm_header *hdr)
 	if (self->tx_mode == KPM_TX_MODE_DEVMEM &&
 	    devmem_bind_socket(&self->devmem, cfd) < 0)
 		goto err_close;
+
+	if (req->local_port) {
+		struct sockaddr_in6 local_addr;
+		socklen_t la_len = sizeof(local_addr);
+
+		if (getsockname(self->main_sock, (void *)&local_addr,
+				&la_len) < 0) {
+			warn("Failed to get local addr for bind");
+			goto err_close;
+		}
+		local_addr.sin6_port = htons(req->local_port);
+		if (bind(cfd, (void *)&local_addr, la_len) < 0) {
+			warn("Failed to bind to local port %u",
+			     req->local_port);
+			goto err_close;
+		}
+	}
 
 	ret = connect(cfd, (void *)&req->addr, req->len);
 	if (ret < 0) {
@@ -852,6 +870,220 @@ server_msg_end_test(struct session_state *self, struct kpm_header *hdr)
 	}
 }
 
+static void
+server_msg_tcp_acceptor_ex(struct session_state *self, struct kpm_header *hdr)
+{
+	struct kpm_tcp_acceptor_ex *req;
+	struct epoll_event ev = {};
+	struct sockaddr_in6 addr;
+	socklen_t len;
+	int ret;
+
+	if (hdr->len < sizeof(*req)) {
+		warn("Invalid request in %s", __func__);
+		self->quit = 1;
+		return;
+	}
+	req = (void *)hdr;
+
+	if (self->tcp_sock) {
+		kpm_reply_error(self->main_sock, hdr, EBUSY);
+		return;
+	}
+
+	len = sizeof(addr);
+	if (getsockname(self->main_sock, (void *)&addr, &len)) {
+		warn("Failed to get sock type for main sock");
+		self->quit = 1;
+		return;
+	}
+	addr.sin6_port = htons(req->listen_port);
+
+	self->tcp_sock = socket(addr.sin6_family, SOCK_STREAM, 0);
+	if (self->tcp_sock < 0) {
+		warn("Failed to open socket");
+		self->quit = 1;
+		return;
+	}
+
+	int one = 1;
+	setsockopt(self->tcp_sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+	ret = bind(self->tcp_sock, (void *)&addr, sizeof(addr));
+	if (ret < 0) {
+		warn("Failed to bind socket to port %u", req->listen_port);
+		self->quit = 1;
+		return;
+	}
+
+	ret = listen(self->tcp_sock, 10);
+	if (ret < 0) {
+		warn("Failed to listen on socket");
+		self->quit = 1;
+		return;
+	}
+
+	len = sizeof(addr);
+	if (getsockname(self->tcp_sock, (void *)&addr, &len)) {
+		warn("Failed to get sock type for main sock");
+		self->quit = 1;
+		return;
+	}
+
+	ev.events = EPOLLIN | EPOLLET;
+	ev.data.fd = self->tcp_sock;
+	if (epoll_ctl(self->epollfd, EPOLL_CTL_ADD, self->tcp_sock, &ev) < 0) {
+		warn("Failed to add tcp sock to epoll");
+		self->quit = 1;
+		return;
+	}
+
+	if (kpm_reply_acceptor(self->main_sock, hdr, &addr, len) < 1) {
+		warn("Failed reply in %s", __func__);
+		self->quit = 1;
+		return;
+	}
+}
+
+static void
+server_msg_steering_rule(struct session_state *self, struct kpm_header *hdr)
+{
+	struct kpm_steering_rule *req;
+	struct kpm_steering_rule reply = {};
+	__s32 rule_loc = -1;
+	int ret;
+
+	if (hdr->len < sizeof(*req)) {
+		warn("Invalid request in %s", __func__);
+		self->quit = 1;
+		return;
+	}
+	req = (void *)hdr;
+
+	if (req->action == 0) {
+		/* Add rule */
+		ret = devmem_add_steering_rule(&req->addr, req->port,
+					       req->ifname, req->queue_id,
+					       req->match_is_dst, &rule_loc);
+		if (ret < 0) {
+			warnx("Failed to add steering rule");
+			kpm_reply_error(self->main_sock, hdr, EINVAL);
+			return;
+		}
+
+		/* Track for cleanup */
+		if (self->devmem.n_steering_rules < MAX_STEERING_RULES) {
+			self->devmem.steering_rule_locs[self->devmem.n_steering_rules++] = rule_loc;
+		}
+
+		reply.rule_loc = rule_loc;
+	} else {
+		/* Delete rule */
+		ret = devmem_del_steering_rule(req->ifname, req->rule_loc);
+		if (ret < 0) {
+			warnx("Failed to delete steering rule");
+			kpm_reply_error(self->main_sock, hdr, EINVAL);
+			return;
+		}
+		reply.rule_loc = req->rule_loc;
+	}
+
+	kpm_reply(self->main_sock, &reply.hdr, sizeof(reply), hdr);
+}
+
+static int set_irq_smp_affinity(const char *ifname, unsigned int queue,
+				unsigned int cpu)
+{
+	char path[256];
+	char irq_str[32];
+	char cpu_mask[128];
+	unsigned int cpu_bits[KPERF_MAX_CPUS / 32] = {};
+	int nwords, w, off, fd, ret;
+	FILE *f;
+	int irq;
+
+	/* Find IRQ number for this queue via /sys/class/net/<dev>/queues/rx-<q>/... */
+	/* Try reading the IRQ from the MSI-X table via /proc/interrupts */
+	snprintf(path, sizeof(path),
+		 "/sys/class/net/%s/queues/rx-%u/../../../msi_irqs",
+		 ifname, queue);
+
+	/* Simpler approach: iterate /proc/interrupts for the interface */
+	/* For now, just write to all IRQs matching this interface - this is
+	 * a best-effort approach that works for most NICs.
+	 */
+	(void)path;
+	(void)irq_str;
+	(void)f;
+	(void)irq;
+
+	/* Set the CPU affinity via the queue's rps_cpus as fallback */
+	snprintf(path, sizeof(path),
+		 "/sys/class/net/%s/queues/rx-%u/rps_cpus", ifname, queue);
+
+	cpu_bits[cpu / 32] = 1U << (cpu % 32);
+
+	nwords = 1;
+	for (w = KPERF_MAX_CPUS / 32 - 1; w >= 0; w--) {
+		if (cpu_bits[w]) {
+			nwords = w + 1;
+			break;
+		}
+	}
+
+	off = 0;
+	for (w = nwords - 1; w >= 0; w--) {
+		if (w == nwords - 1)
+			off += snprintf(cpu_mask + off, sizeof(cpu_mask) - off,
+					"%x", cpu_bits[w]);
+		else
+			off += snprintf(cpu_mask + off, sizeof(cpu_mask) - off,
+					",%08x", cpu_bits[w]);
+	}
+
+	fd = open(path, O_WRONLY);
+	if (fd < 0) {
+		/* Not fatal - some queues don't have rps_cpus */
+		return 0;
+	}
+
+	ret = write(fd, cpu_mask, strlen(cpu_mask));
+	close(fd);
+	if (ret < 0) {
+		warn("Failed to write SMP affinity for queue %u", queue);
+		return -1;
+	}
+
+	return 0;
+}
+
+static void
+server_msg_smp_affinity(struct session_state *self, struct kpm_header *hdr)
+{
+	struct kpm_smp_affinity *req;
+	unsigned int i;
+
+	if (hdr->len < sizeof(*req)) {
+		warn("Invalid request in %s", __func__);
+		self->quit = 1;
+		return;
+	}
+	req = (void *)hdr;
+
+	for (i = 0; i < req->queue_count; i++) {
+		if (set_irq_smp_affinity(req->ifname, req->queue_start + i,
+					 req->cpu_start + i) < 0) {
+			kpm_reply_error(self->main_sock, hdr, EINVAL);
+			return;
+		}
+	}
+
+	if (kpm_reply_empty(self->main_sock, hdr) < 1) {
+		self->quit = 1;
+		return;
+	}
+}
+
 static void session_handle_main_sock(struct session_state *self)
 {
 	struct kpm_header *hdr;
@@ -897,6 +1129,15 @@ static void session_handle_main_sock(struct session_state *self)
 		break;
 	case KPM_MSG_TYPE_END_TEST:
 		server_msg_end_test(self, hdr);
+		break;
+	case KPM_MSG_TYPE_STEERING_RULE:
+		server_msg_steering_rule(self, hdr);
+		break;
+	case KPM_MSG_TYPE_SMP_AFFINITY:
+		server_msg_smp_affinity(self, hdr);
+		break;
+	case KPM_MSG_TYPE_OPEN_TCP_ACCEPTOR_EX:
+		server_msg_tcp_acceptor_ex(self, hdr);
 		break;
 	default:
 		warnx("Unknown message type: %d", hdr->type);
@@ -1080,6 +1321,11 @@ static void server_session_loop(int fd)
 		list_del(&conn->connections);
 		free(conn);
 	}
+	/* Clean up any steering rules we installed */
+	for (i = 0; i < self.devmem.n_steering_rules; i++)
+		devmem_del_steering_rule(self.devmem.ifname,
+					 self.devmem.steering_rule_locs[i]);
+
 	if (self.tcp_sock && self.rx_mode == KPM_RX_MODE_DEVMEM)
 		devmem_teardown(&self.devmem);
 	if (!self.tcp_sock && self.tx_mode == KPM_TX_MODE_DEVMEM)

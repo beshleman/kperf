@@ -84,6 +84,8 @@ struct connection_devmem {
 	char ctrl_data[64 * 1024];
 };
 
+#define MAX_STEERING_RULES 64
+
 struct session_state_devmem {
 	struct ynl_sock *ys;
 	char ifname[IFNAMSIZ];
@@ -98,6 +100,10 @@ struct session_state_devmem {
 	__u32 dmabuf_tx_size_mb;
 	enum memory_provider_type tx_provider;
 	struct sockaddr_in6 addr;
+
+	/* Steering rule tracking for cleanup */
+	int steering_rule_locs[MAX_STEERING_RULES];
+	int n_steering_rules;
 };
 
 struct worker_state_devmem {

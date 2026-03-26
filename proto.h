@@ -30,6 +30,9 @@ enum kpm_msg_type {
 	KPM_MSG_TYPE_TEST,
 	KPM_MSG_TYPE_TEST_RESULT,
 	KPM_MSG_TYPE_END_TEST,
+	KPM_MSG_TYPE_STEERING_RULE,
+	KPM_MSG_TYPE_SMP_AFFINITY,
+	KPM_MSG_TYPE_OPEN_TCP_ACCEPTOR_EX,
 
 	KPM_MSG_WORKER_ID,
 	KPM_MSG_WORKER_KILL,
@@ -92,6 +95,33 @@ struct kpm_connect {
 	socklen_t len;
 	struct sockaddr_in6 addr;
 	__u32 mss;
+	__u16 local_port;
+	__u16 pad2;
+};
+
+struct kpm_steering_rule {
+	struct kpm_header hdr;
+	struct sockaddr_in6 addr;
+	__u16 port;		/* network byte order */
+	__u8 match_is_dst;	/* 1=match dst, 0=match src */
+	__u8 action;		/* 0=add, 1=delete */
+	__s32 queue_id;		/* target queue for add */
+	__s32 rule_loc;		/* rule location (for delete; returned on add) */
+	char ifname[16];
+};
+
+struct kpm_smp_affinity {
+	struct kpm_header hdr;
+	__u32 queue_start;
+	__u32 queue_count;
+	__u32 cpu_start;
+	char ifname[16];
+};
+
+struct kpm_tcp_acceptor_ex {
+	struct kpm_header hdr;
+	__u16 listen_port;
+	__u16 pad;
 };
 
 struct kpm_connect_reply {
@@ -306,6 +336,8 @@ int kpm_send_u32(int fd, enum kpm_msg_type type, __u32 arg);
 int kpm_send_conn_id(int fd, __u32 id, __u32 cpu);
 int kpm_send_connect(int fd, struct sockaddr_in6 *addr, socklen_t len,
 		     __u32 mss);
+int kpm_send_connect_ex(int fd, struct sockaddr_in6 *addr, socklen_t len,
+			__u32 mss, __u16 local_port);
 int kpm_send_tls(int fd, __u32 conn_id, __u32 dir_mask,
 		 void *info, socklen_t len);
 int kpm_send_max_pacing(int fd, __u32 id, __u64 max_pace);
@@ -315,6 +347,8 @@ int kpm_send_pin_worker(int fd, __u32 id, __u32 cpu);
 
 void kpm_reply_error(int fd, struct kpm_header *hdr, __u16 error);
 
+int kpm_reply(int fd, struct kpm_header *msg, size_t size,
+	      struct kpm_header *req);
 int kpm_reply_empty(int fd, struct kpm_header *hdr);
 int kpm_reply_u16(int fd, struct kpm_header *hdr, __u16 arg);
 int kpm_reply_u32(int fd, struct kpm_header *hdr, __u32 arg);
@@ -328,6 +362,11 @@ int kpm_reply_connect(int fd, struct kpm_header *hdr,
 int kpm_xchg_hello(int fd, unsigned int *ncpus);
 
 int kpm_req_tcp_sock(int fd, struct sockaddr_in6 *addr, socklen_t *len);
+int kpm_req_tcp_sock_ex(int fd, __u16 listen_port,
+			struct sockaddr_in6 *addr, socklen_t *len);
+int kpm_req_steering_rule(int fd, struct kpm_steering_rule *rule,
+			  __s32 *out_rule_loc);
+int kpm_req_smp_affinity(int fd, struct kpm_smp_affinity *aff);
 int kpm_req_end_test(int fd, __u32 test_id);
 int kpm_req_tls(int fd, __u32 conn_id, __u32 dir_mask,
 		void *info, socklen_t len);
