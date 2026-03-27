@@ -5,10 +5,13 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <pthread.h>
 #include <sched.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 #include <linux/in6.h>
 #include <linux/socket.h>
@@ -560,13 +563,13 @@ server_msg_mode(struct session_state *self, struct kpm_header *hdr)
 	}
 
 	self->rx_mode = req->rx_mode;
-	if (!self->tcp_sock)
-		self->tx_mode = req->tx_mode;
+	self->tx_mode = req->tx_mode;
 	self->validate = req->validate;
 	self->iou = req->iou;
 	self->iou_state.rx_size_mb = req->iou_rx_size_mb;
 
-	if (!self->tcp_sock && (req->tx_mode == KPM_TX_MODE_DEVMEM)) {
+	if (req->tx_mode == KPM_TX_MODE_DEVMEM &&
+	    req->addr.sin6_family != 0) {
 		ret = devmem_setup_tx(&self->devmem, req->tx_provider, req->dmabuf_tx_size_mb,
 				      &req->dev, &req->addr, req->xps_irq_start,
 				      req->num_rx_queues, req->xps_pin_off);
@@ -751,8 +754,12 @@ bad_req:
 	test->worker_range = max_wrk - min_wrk + 1;
 
 	fwd = calloc(test->worker_range, sizeof(void *));
-	for (i = 0; i < n_conns; i++)
-		fwd[i] = calloc(1, hdr->len);
+	for (i = 0; i < n_conns; i++) {
+		unsigned int idx = req->specs[i].worker_id - min_wrk;
+
+		if (!fwd[idx])
+			fwd[idx] = calloc(1, hdr->len);
+	}
 	test->results = calloc(test->worker_range, sizeof(*test->results));
 
 	for (i = 0; i < n_conns; i++) {
@@ -784,7 +791,7 @@ bad_req:
 		struct kpm_test *msg;
 
 		msg = fwd[i];
-		if (!msg->n_conns)
+		if (!msg || !msg->n_conns)
 			continue;
 		msg->active = req->active;
 		msg->time_sec = req->time_sec;
@@ -851,8 +858,9 @@ server_msg_end_test(struct session_state *self, struct kpm_header *hdr)
 		struct kpm_test *msg;
 
 		msg = test->fwd[i];
-		if (!msg->n_conns) {
-			warnx("no conns on %d", i);
+		if (!msg || !msg->n_conns) {
+			if (msg)
+				warnx("no conns on %d", i);
 			continue;
 		}
 
@@ -991,69 +999,136 @@ server_msg_steering_rule(struct session_state *self, struct kpm_header *hdr)
 	kpm_reply(self->main_sock, &reply.hdr, sizeof(reply), hdr);
 }
 
+/* Resolve PCI address for a network interface.
+ * Reads the symlink /sys/class/net/<ifname>/device to get the PCI slot.
+ * Returns 0 on success, -1 on failure.
+ */
+static int get_pci_addr(const char *ifname, char *pci_addr, size_t len)
+{
+	char path[256];
+	char link[PATH_MAX];
+	ssize_t n;
+	char *slash;
+
+	snprintf(path, sizeof(path), "/sys/class/net/%s/device", ifname);
+	n = readlink(path, link, sizeof(link) - 1);
+	if (n < 0)
+		return -1;
+	link[n] = '\0';
+
+	/* The symlink target ends with the PCI address, e.g.
+	 * ../../../0000:4b:00.0
+	 */
+	slash = strrchr(link, '/');
+	if (slash)
+		slash++;
+	else
+		slash = link;
+
+	snprintf(pci_addr, len, "%s", slash);
+	return 0;
+}
+
+/* Find the IRQ number for a given NIC queue by parsing /proc/interrupts.
+ * Supports:
+ *   - mlx5: mlx5_comp<queue>@pci:<pci_addr>
+ *   - generic: <ifname>-TxRx-<queue> or <ifname>-<queue>
+ * Returns the IRQ number or -1 if not found.
+ */
+static int find_queue_irq(const char *ifname, unsigned int queue)
+{
+	char pci_addr[PATH_MAX] = {};
+	char needle[128];
+	char line[4096];
+	FILE *f;
+	int irq = -1;
+	int have_pci;
+
+	have_pci = (get_pci_addr(ifname, pci_addr, sizeof(pci_addr)) == 0);
+
+	f = fopen("/proc/interrupts", "r");
+	if (!f)
+		return -1;
+
+	while (fgets(line, sizeof(line), f)) {
+		char *p;
+
+		/* Pattern 1: mlx5_comp<queue>@pci:<pci_addr> */
+		if (have_pci) {
+			snprintf(needle, sizeof(needle),
+				 "mlx5_comp%u@pci:%s", queue, pci_addr);
+			p = strstr(line, needle);
+			if (p) {
+				char c = p[strlen(needle)];
+
+				if (c == '\n' || c == '\0' || c == ' ')
+					goto found;
+			}
+		}
+
+		/* Pattern 2: <ifname>-TxRx-<queue> */
+		snprintf(needle, sizeof(needle), "%s-TxRx-%u", ifname, queue);
+		p = strstr(line, needle);
+		if (p) {
+			char c = p[strlen(needle)];
+
+			if (c == '\n' || c == '\0' || c == ' ')
+				goto found;
+		}
+
+		/* Pattern 3: <ifname>-<queue> (generic) */
+		snprintf(needle, sizeof(needle), "%s-%u", ifname, queue);
+		p = strstr(line, needle);
+		if (p) {
+			char c = p[strlen(needle)];
+
+			if (c == '\n' || c == '\0' || c == ' ')
+				goto found;
+		}
+
+		continue;
+found:
+		irq = strtol(line, NULL, 10);
+		break;
+	}
+
+	fclose(f);
+	return irq;
+}
+
 static int set_irq_smp_affinity(const char *ifname, unsigned int queue,
 				unsigned int cpu)
 {
 	char path[256];
-	char irq_str[32];
-	char cpu_mask[128];
-	unsigned int cpu_bits[KPERF_MAX_CPUS / 32] = {};
-	int nwords, w, off, fd, ret;
-	FILE *f;
-	int irq;
+	char cpu_str[32];
+	int irq, fd, ret;
 
-	/* Find IRQ number for this queue via /sys/class/net/<dev>/queues/rx-<q>/... */
-	/* Try reading the IRQ from the MSI-X table via /proc/interrupts */
-	snprintf(path, sizeof(path),
-		 "/sys/class/net/%s/queues/rx-%u/../../../msi_irqs",
-		 ifname, queue);
-
-	/* Simpler approach: iterate /proc/interrupts for the interface */
-	/* For now, just write to all IRQs matching this interface - this is
-	 * a best-effort approach that works for most NICs.
-	 */
-	(void)path;
-	(void)irq_str;
-	(void)f;
-	(void)irq;
-
-	/* Set the CPU affinity via the queue's rps_cpus as fallback */
-	snprintf(path, sizeof(path),
-		 "/sys/class/net/%s/queues/rx-%u/rps_cpus", ifname, queue);
-
-	cpu_bits[cpu / 32] = 1U << (cpu % 32);
-
-	nwords = 1;
-	for (w = KPERF_MAX_CPUS / 32 - 1; w >= 0; w--) {
-		if (cpu_bits[w]) {
-			nwords = w + 1;
-			break;
-		}
-	}
-
-	off = 0;
-	for (w = nwords - 1; w >= 0; w--) {
-		if (w == nwords - 1)
-			off += snprintf(cpu_mask + off, sizeof(cpu_mask) - off,
-					"%x", cpu_bits[w]);
-		else
-			off += snprintf(cpu_mask + off, sizeof(cpu_mask) - off,
-					",%08x", cpu_bits[w]);
-	}
-
-	fd = open(path, O_WRONLY);
-	if (fd < 0) {
-		/* Not fatal - some queues don't have rps_cpus */
-		return 0;
-	}
-
-	ret = write(fd, cpu_mask, strlen(cpu_mask));
-	close(fd);
-	if (ret < 0) {
-		warn("Failed to write SMP affinity for queue %u", queue);
+	irq = find_queue_irq(ifname, queue);
+	if (irq < 0) {
+		warnx("Could not find IRQ for %s queue %u in /proc/interrupts",
+		      ifname, queue);
 		return -1;
 	}
 
+	/* Set hardware IRQ affinity via /proc/irq/<irq>/smp_affinity_list */
+	snprintf(path, sizeof(path), "/proc/irq/%d/smp_affinity_list", irq);
+	snprintf(cpu_str, sizeof(cpu_str), "%u", cpu);
+
+	fd = open(path, O_WRONLY);
+	if (fd < 0) {
+		warn("Failed to open %s", path);
+		return -1;
+	}
+
+	ret = write(fd, cpu_str, strlen(cpu_str));
+	close(fd);
+	if (ret < 0) {
+		warn("Failed to write IRQ affinity for %s queue %u (irq %d -> cpu %u)",
+		     ifname, queue, irq, cpu);
+		return -1;
+	}
+
+	warnx("Set IRQ %d (%s queue %u) -> CPU %u", irq, ifname, queue, cpu);
 	return 0;
 }
 
@@ -1069,6 +1144,9 @@ server_msg_smp_affinity(struct session_state *self, struct kpm_header *hdr)
 		return;
 	}
 	req = (void *)hdr;
+
+	warnx("SMP affinity request: ifname=%s queue_start=%u queue_count=%u cpu_start=%u",
+	      req->ifname, req->queue_start, req->queue_count, req->cpu_start);
 
 	for (i = 0; i < req->queue_count; i++) {
 		if (set_irq_smp_affinity(req->ifname, req->queue_start + i,
@@ -1328,7 +1406,7 @@ static void server_session_loop(int fd)
 
 	if (self.tcp_sock && self.rx_mode == KPM_RX_MODE_DEVMEM)
 		devmem_teardown(&self.devmem);
-	if (!self.tcp_sock && self.tx_mode == KPM_TX_MODE_DEVMEM)
+	if (self.tx_mode == KPM_TX_MODE_DEVMEM)
 		devmem_teardown_tx(&self.devmem);
 	if (self.tcp_sock && self.iou && self.rx_mode == KPM_RX_MODE_SOCKET_ZEROCOPY)
 		iou_zerocopy_rx_teardown(&self.iou_state);

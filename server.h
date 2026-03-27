@@ -95,6 +95,7 @@ struct session_state_devmem {
 	int rss_context;
 
 	/* TX */
+	struct ynl_sock *tx_ys;
 	struct memory_buffer *tx_mem;
 	struct pci_dev tx_dev;
 	__u32 dmabuf_tx_size_mb;

@@ -1404,13 +1404,13 @@ int devmem_setup_tx(struct session_state_devmem *devmem, enum memory_provider_ty
 			  num_irq_cpus, xps_pin_off) < 0)
 		warnx("XPS configuration failed for TX, continuing anyway");
 
-	devmem->ys = ynl_sock_create(&ynl_netdev_family, &yerr);
-	if (!devmem->ys) {
+	devmem->tx_ys = ynl_sock_create(&ynl_netdev_family, &yerr);
+	if (!devmem->tx_ys) {
 		warnx("Failed to setup YNL socket: %s", yerr.msg);
 		return -1;
 	}
 
-	devmem->tx_mem->dmabuf_id = bind_tx_queue(ifindex, devmem->tx_mem->fd, devmem->ys);
+	devmem->tx_mem->dmabuf_id = bind_tx_queue(ifindex, devmem->tx_mem->fd, devmem->tx_ys);
 	if (devmem->tx_mem->dmabuf_id < 0) {
 		warnx("Failed to bind TX queue dmabuf: %d\n", devmem->tx_mem->dmabuf_id);
 		ret = -1;
@@ -1421,8 +1421,8 @@ int devmem_setup_tx(struct session_state_devmem *devmem, enum memory_provider_ty
 	return 0;
 
 sock_destroy:
-	ynl_sock_destroy(devmem->ys);
-	devmem->ys = NULL;
+	ynl_sock_destroy(devmem->tx_ys);
+	devmem->tx_ys = NULL;
 	return ret;
 }
 
@@ -1433,8 +1433,8 @@ void devmem_teardown_tx(struct session_state_devmem *devmem)
 		devmem->tx_mem = NULL;
 	}
 
-	if (devmem->ys) {
-		ynl_sock_destroy(devmem->ys);
-		devmem->ys = NULL;
+	if (devmem->tx_ys) {
+		ynl_sock_destroy(devmem->tx_ys);
+		devmem->tx_ys = NULL;
 	}
 }

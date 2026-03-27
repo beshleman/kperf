@@ -79,6 +79,11 @@ static struct {
 	unsigned int dst_local_port_start;
 	unsigned int src_listen_port;
 	unsigned int dst_listen_port;
+	char *src_ifname;
+	char *dst_ifname;
+	unsigned int src_cpu_start;
+	unsigned int dst_cpu_start;
+	bool bidi_spread;
 } opt = {
 	.tls_ver = TLS_1_3_VERSION,
 	.src = "localhost",
@@ -141,11 +146,9 @@ opt_set_memory_provider(const char *arg, enum memory_provider_type *provider)
 {
 	char *ret;
 
-	if (!strcmp(arg, "cuda")) {
-#ifndef USE_CUDA
-		return arg_bad("memory provider %s requires kperf compiled with CUDA", arg);
-#endif
-	}
+	/* Client accepts cuda provider unconditionally; actual CUDA
+	 * work is done by the server which must be built with CUDA.
+	 */
 
 	ret = NULL;
 	if (!strcmp(arg, "host")) {
@@ -319,6 +322,16 @@ static const struct opt_table opts[] = {
 		     &opt.src_listen_port, "Source listen port for acceptor"),
 	OPT_WITH_ARG("--dst-listen-port <arg>", opt_set_uintval, opt_show_uintval,
 		     &opt.dst_listen_port, "Destination listen port for acceptor"),
+	OPT_WITH_ARG("--src-ifname <arg>", opt_set_charp, opt_show_charp,
+		     &opt.src_ifname, "Source interface name for steering/affinity"),
+	OPT_WITH_ARG("--dst-ifname <arg>", opt_set_charp, opt_show_charp,
+		     &opt.dst_ifname, "Destination interface name for steering/affinity"),
+	OPT_WITH_ARG("--src-cpu-start <arg>", opt_set_uintval, opt_show_uintval,
+		     &opt.src_cpu_start, "Source CPU start for SMP affinity"),
+	OPT_WITH_ARG("--dst-cpu-start <arg>", opt_set_uintval, opt_show_uintval,
+		     &opt.dst_cpu_start, "Destination CPU start for SMP affinity"),
+	OPT_WITHOUT_ARG("--bidi-spread", opt_set_bool, &opt.bidi_spread,
+			"Spread bidi CPU pinning (no TX net / RX app overlap)"),
 	OPT_ENDTABLE
 };
 
@@ -518,21 +531,22 @@ show_cpu_stat(const char *pfx, struct kpm_test_results *result, unsigned int id)
 
 static void
 dump_result(struct kpm_test_results *result, const char *dir,
-	    struct kpm_connect_reply *conns, bool local)
+	    struct kpm_connect_reply *conns, bool local,
+	    const __u32 *net_cpus)
 {
 	unsigned int end = 0, i, r;
 	int start = -1;
 
 	warnx("== %s", dir);
 	for (r = 0; r < opt.n_conns; r++)
-		warnx("  Tx%7.3lf Gbps (%llu bytes in %u usec)",
+		warnx("  Tx %7.3lf Gbps (%llu bytes in %u usec)",
 		      (double)result->res[r].tx_bytes * 8 /
 		      result->time_usec /
 		      1000,
 		      result->res[r].tx_bytes,
 		      result->time_usec);
 	for (r = 0; r < opt.n_conns; r++)
-		warnx("  Rx%7.3lf Gbps (%llu bytes in %u usec)",
+		warnx("  Rx %7.3lf Gbps (%llu bytes in %u usec)",
 		      (double)result->res[r].rx_bytes * 8 /
 		      result->time_usec /
 		      1000,
@@ -549,7 +563,10 @@ dump_result(struct kpm_test_results *result, const char *dir,
 	for (r = 0; r < opt.n_conns; r++) {
 		int flow_cpu;
 
-		flow_cpu = local ? conns[r].local.cpu : conns[r].remote.cpu;
+		if (net_cpus)
+			flow_cpu = net_cpus[r];
+		else
+			flow_cpu = local ? conns[r].local.cpu : conns[r].remote.cpu;
 		show_cpu_stat(opt.pin_off ? "net " : "", result, flow_cpu);
 		if (opt.pin_off)
 			show_cpu_stat("app ", result, flow_cpu + opt.pin_off);
@@ -797,20 +814,41 @@ static int run_bidirectional(int src, int dst,
 	unsigned int i;
 	size_t sz;
 	int seq;
-	struct sockaddr_in6 src_addr = {};
+	struct sockaddr_in6 src_addr = {}, dst_addr = {};
+	__s32 *steering_rule_locs = NULL;
+	unsigned int n_steering_rules = 0;
 	int ret = -1;
 
 	if (inet_sockaddr(opt.src, &src_addr) < 0) {
 		warnx("failed to get sockaddr from %s", opt.src);
 		return -1;
 	}
+	if (inet_sockaddr(opt.dst, &dst_addr) < 0) {
+		warnx("failed to get sockaddr from %s", opt.dst);
+		return -1;
+	}
+
+	/* Max 4 rules per flow: fwd data, rev data, fwd ACK, rev ACK */
+	steering_rule_locs = calloc(opt.n_conns * 4, sizeof(__s32));
+
+	/* Net CPU arrays for correct CPU stat reporting */
+	__u32 *fwd_src_net_cpu = calloc(opt.n_conns, sizeof(__u32));
+	__u32 *fwd_dst_net_cpu = calloc(opt.n_conns, sizeof(__u32));
+	__u32 *rev_src_net_cpu = calloc(opt.n_conns, sizeof(__u32));
+	__u32 *rev_dst_net_cpu = calloc(opt.n_conns, sizeof(__u32));
 
 	fwd_src_wrk_id = calloc(opt.n_conns, sizeof(__u32));
 	fwd_dst_wrk_id = calloc(opt.n_conns, sizeof(__u32));
 	rev_src_wrk_id = calloc(opt.n_conns, sizeof(__u32));
 	rev_dst_wrk_id = calloc(opt.n_conns, sizeof(__u32));
 
-	/* Phase 1: NIC Setup - configure modes on both hosts */
+	/* Phase 1: NIC Setup - configure modes on both hosts
+	 *
+	 * In spread mode, TX app CPUs are at net_cpu + n_conns, so
+	 * xps_pin_off = n_conns to pair XPS correctly.
+	 */
+	__u32 bidi_xps_pin_off = opt.bidi_spread ? opt.n_conns : opt.pin_off;
+
 	struct kpm_mode dst_mode = {
 		.rx_mode = opt.devmem_rx ? KPM_RX_MODE_DEVMEM : KPM_RX_MODE_SOCKET,
 		.tx_mode = opt.devmem_tx ? KPM_TX_MODE_DEVMEM : KPM_TX_MODE_SOCKET,
@@ -820,10 +858,11 @@ static int run_bidirectional(int src, int dst,
 		.dmabuf_rx_size_mb = opt.dmabuf_rx_size_mb,
 		.dmabuf_tx_size_mb = opt.dmabuf_tx_size_mb,
 		.num_rx_queues = opt.num_rx_queues,
+		.addr = dst_addr,
 		.validate = opt.validate,
 		.iou = opt.iou_dst,
 		.iou_rx_size_mb = opt.iou_rx_size_mb,
-		.xps_pin_off = opt.pin_off,
+		.xps_pin_off = bidi_xps_pin_off,
 		.xps_irq_start = opt.xps_dst_irq_start,
 	};
 
@@ -840,7 +879,7 @@ static int run_bidirectional(int src, int dst,
 		.validate = opt.validate,
 		.iou = opt.iou_src,
 		.iou_rx_size_mb = opt.iou_rx_size_mb,
-		.xps_pin_off = opt.pin_off,
+		.xps_pin_off = bidi_xps_pin_off,
 		.xps_irq_start = opt.xps_src_irq_start,
 	};
 
@@ -887,6 +926,53 @@ static int run_bidirectional(int src, int dst,
 		goto out;
 	}
 
+	/* Phase 2b: SMP affinity - pin queue IRQs to NUMA-local CPUs */
+	if (opt.dst_ifname) {
+		struct kpm_smp_affinity aff = {};
+
+		strncpy(aff.ifname, opt.dst_ifname, sizeof(aff.ifname) - 1);
+
+		/* dst data queues: receive forward traffic */
+		aff.queue_start = opt.dst_queue_start;
+		aff.queue_count = opt.n_conns;
+		aff.cpu_start = opt.dst_cpu_start;
+		if (kpm_req_smp_affinity(dst, &aff) < 0)
+			warnx("Failed to set dst data queue affinity");
+
+		/* dst ACK queues: receive ACKs for reverse TX
+		 * Spread: ACK IRQs at cpu_start + 2*N (zone 3)
+		 * Default: ACK IRQs at cpu_start + N (zone 2, overlaps RX app)
+		 */
+		if (opt.dst_ack_queue_start) {
+			aff.queue_start = opt.dst_ack_queue_start;
+			aff.cpu_start = opt.dst_cpu_start +
+				(opt.bidi_spread ? 2 * opt.n_conns : opt.n_conns);
+			if (kpm_req_smp_affinity(dst, &aff) < 0)
+				warnx("Failed to set dst ACK queue affinity");
+		}
+	}
+	if (opt.src_ifname) {
+		struct kpm_smp_affinity aff = {};
+
+		strncpy(aff.ifname, opt.src_ifname, sizeof(aff.ifname) - 1);
+
+		/* src data queues: receive reverse traffic */
+		aff.queue_start = opt.src_queue_start;
+		aff.queue_count = opt.n_conns;
+		aff.cpu_start = opt.src_cpu_start;
+		if (kpm_req_smp_affinity(src, &aff) < 0)
+			warnx("Failed to set src data queue affinity");
+
+		/* src ACK queues: receive ACKs for forward TX */
+		if (opt.src_ack_queue_start) {
+			aff.queue_start = opt.src_ack_queue_start;
+			aff.cpu_start = opt.src_cpu_start +
+				(opt.bidi_spread ? 2 * opt.n_conns : opt.n_conns);
+			if (kpm_req_smp_affinity(src, &aff) < 0)
+				warnx("Failed to set src ACK queue affinity");
+		}
+	}
+
 	/* Phase 3: Establish connections in both directions */
 	warnx("Establishing forward connections (src -> dst)...");
 	fwd_conns = spawn_conn(src, dst, &fwd_conn_addr, len);
@@ -902,16 +988,142 @@ static int run_bidirectional(int src, int dst,
 		goto out;
 	}
 
-	/* Phase 4: Spawn and pin workers for both directions */
+	/* Phase 3b: Install steering rules to pin flows to queues */
+	if (opt.dst_ifname) {
+		for (i = 0; i < opt.n_conns; i++) {
+			/* Steer forward RX data to dst data queue[i] */
+			if (install_steering_rule(dst, opt.dst_ifname,
+						  &src_addr,
+						  fwd_conns[i].local.port,
+						  opt.dst_queue_start + i,
+						  false,
+						  &steering_rule_locs[n_steering_rules]) < 0)
+				warnx("Failed to install fwd data steering rule %u", i);
+			else
+				n_steering_rules++;
+		}
+	}
+	if (opt.src_ifname) {
+		for (i = 0; i < opt.n_conns; i++) {
+			/* Steer reverse RX data to src data queue[i] */
+			if (install_steering_rule(src, opt.src_ifname,
+						  &dst_addr,
+						  rev_conns[i].local.port,
+						  opt.src_queue_start + i,
+						  false,
+						  &steering_rule_locs[n_steering_rules]) < 0)
+				warnx("Failed to install rev data steering rule %u", i);
+			else
+				n_steering_rules++;
+		}
+	}
+	if (opt.src_ifname && opt.src_ack_queue_start) {
+		for (i = 0; i < opt.n_conns; i++) {
+			/* Steer forward TX ACKs to src ACK queue[i] */
+			if (install_steering_rule(src, opt.src_ifname,
+						  &dst_addr,
+						  fwd_conns[i].remote.port,
+						  opt.src_ack_queue_start + i,
+						  false,
+						  &steering_rule_locs[n_steering_rules]) < 0)
+				warnx("Failed to install fwd ACK steering rule %u", i);
+			else
+				n_steering_rules++;
+		}
+	}
+	if (opt.dst_ifname && opt.dst_ack_queue_start) {
+		for (i = 0; i < opt.n_conns; i++) {
+			/* Steer reverse TX ACKs to dst ACK queue[i] */
+			if (install_steering_rule(dst, opt.dst_ifname,
+						  &src_addr,
+						  rev_conns[i].remote.port,
+						  opt.dst_ack_queue_start + i,
+						  false,
+						  &steering_rule_locs[n_steering_rules]) < 0)
+				warnx("Failed to install rev ACK steering rule %u", i);
+			else
+				n_steering_rules++;
+		}
+	}
+
+	/* Phase 4: Spawn and pin workers for both directions
+	 *
+	 * Default layout (pin_off=N, overlapping):
+	 *   Per-NUMA: [RX data net: N] [TX ack net + RX app: N] [TX app: N]
+	 *   Total: 3*N CPUs per NUMA node
+	 *   Example (N=4, NUMA 0 at CPU 0):
+	 *     CPUs 0-3: RX net (data queues)
+	 *     CPUs 4-7: TX net (ack queues) AND RX app (overlap!)
+	 *     CPUs 8-11: TX app
+	 *
+	 * Spread layout (--bidi-spread, no overlap):
+	 *   Per-NUMA: [RX data net: N] [RX app: N] [TX ack net: N] [TX app: N]
+	 *   Total: 4*N CPUs per NUMA node
+	 *   Example (N=4, NUMA 0 at CPU 0):
+	 *     CPUs 0-3: RX net (data queues)
+	 *     CPUs 4-7: RX app
+	 *     CPUs 8-11: TX net (ack queues)
+	 *     CPUs 12-15: TX app
+	 */
 	for (i = 0; i < opt.n_conns; i++) {
-		/* Forward: src sends, pin src worker on src */
-		__u32 fwd_src_cpu = fwd_conns[i].local.cpu + opt.pin_off;
-		/* Forward: dst receives, pin dst worker on dst */
-		__u32 fwd_dst_cpu = fwd_conns[i].remote.cpu + opt.pin_off;
-		/* Reverse: dst sends, pin dst worker on dst */
-		__u32 rev_src_cpu = rev_conns[i].local.cpu + opt.pin_off;
-		/* Reverse: src receives, pin src worker on src */
-		__u32 rev_dst_cpu = rev_conns[i].remote.cpu + opt.pin_off;
+		__u32 fwd_src_cpu, fwd_dst_cpu, rev_src_cpu, rev_dst_cpu;
+
+		if (opt.src_ifname) {
+			if (opt.bidi_spread) {
+				/* Spread: TX net at cpu_start + 2*N */
+				fwd_src_net_cpu[i] = opt.src_cpu_start + 2 * opt.n_conns + i;
+				fwd_src_cpu = opt.src_cpu_start + 3 * opt.n_conns + i;
+			} else {
+				/* Default: TX net at cpu_start + N, app at + pin_off */
+				fwd_src_net_cpu[i] = opt.src_cpu_start + opt.n_conns + i;
+				fwd_src_cpu = opt.src_cpu_start + opt.n_conns + i + opt.pin_off;
+			}
+		} else {
+			fwd_src_cpu = fwd_conns[i].local.cpu + opt.pin_off;
+			fwd_src_net_cpu[i] = fwd_conns[i].local.cpu;
+		}
+
+		if (opt.dst_ifname) {
+			if (opt.bidi_spread) {
+				/* Spread: RX net at cpu_start, app at cpu_start + N */
+				fwd_dst_net_cpu[i] = opt.dst_cpu_start + i;
+				fwd_dst_cpu = opt.dst_cpu_start + opt.n_conns + i;
+			} else {
+				fwd_dst_net_cpu[i] = opt.dst_cpu_start + i;
+				fwd_dst_cpu = opt.dst_cpu_start + i + opt.pin_off;
+			}
+		} else {
+			fwd_dst_cpu = fwd_conns[i].remote.cpu + opt.pin_off;
+			fwd_dst_net_cpu[i] = fwd_conns[i].remote.cpu;
+		}
+
+		if (opt.dst_ifname) {
+			if (opt.bidi_spread) {
+				/* Spread: TX net at cpu_start + 2*N */
+				rev_src_net_cpu[i] = opt.dst_cpu_start + 2 * opt.n_conns + i;
+				rev_src_cpu = opt.dst_cpu_start + 3 * opt.n_conns + i;
+			} else {
+				rev_src_net_cpu[i] = opt.dst_cpu_start + opt.n_conns + i;
+				rev_src_cpu = opt.dst_cpu_start + opt.n_conns + i + opt.pin_off;
+			}
+		} else {
+			rev_src_cpu = rev_conns[i].local.cpu + opt.pin_off;
+			rev_src_net_cpu[i] = rev_conns[i].local.cpu;
+		}
+
+		if (opt.src_ifname) {
+			if (opt.bidi_spread) {
+				/* Spread: RX net at cpu_start, app at cpu_start + N */
+				rev_dst_net_cpu[i] = opt.src_cpu_start + i;
+				rev_dst_cpu = opt.src_cpu_start + opt.n_conns + i;
+			} else {
+				rev_dst_net_cpu[i] = opt.src_cpu_start + i;
+				rev_dst_cpu = opt.src_cpu_start + i + opt.pin_off;
+			}
+		} else {
+			rev_dst_cpu = rev_conns[i].remote.cpu + opt.pin_off;
+			rev_dst_net_cpu[i] = rev_conns[i].remote.cpu;
+		}
 
 		if (spawn_worker(src, fwd_src_cpu, &fwd_src_wrk_id[i]) ||
 		    spawn_worker(dst, fwd_dst_cpu, &fwd_dst_wrk_id[i]) ||
@@ -1039,10 +1251,12 @@ static int run_bidirectional(int src, int dst,
 				if (result && result->hdr.type == KPM_MSG_TYPE_TEST_RESULT) {
 					if (result->test_id == fwd_src_tst_id) {
 						dump_result(result, "Forward Source (TX)",
-							    fwd_conns, true);
+							    fwd_conns, true,
+							    fwd_src_net_cpu);
 					} else {
 						dump_result(result, "Reverse Target (RX)",
-							    rev_conns, false);
+							    rev_conns, false,
+							    rev_dst_net_cpu);
 					}
 					results_collected++;
 					free(result);
@@ -1053,10 +1267,12 @@ static int run_bidirectional(int src, int dst,
 				if (result && result->hdr.type == KPM_MSG_TYPE_TEST_RESULT) {
 					if (result->test_id == rev_src_tst_id) {
 						dump_result(result, "Reverse Source (TX)",
-							    rev_conns, true);
+							    rev_conns, true,
+							    rev_src_net_cpu);
 					} else {
 						dump_result(result, "Forward Target (RX)",
-							    fwd_conns, false);
+							    fwd_conns, false,
+							    fwd_dst_net_cpu);
 					}
 					results_collected++;
 					free(result);
@@ -1088,10 +1304,12 @@ static int run_bidirectional(int src, int dst,
 				if (result && result->hdr.type == KPM_MSG_TYPE_TEST_RESULT) {
 					if (result->test_id == fwd_src_tst_id) {
 						dump_result(result, "Forward Source (TX)",
-							    fwd_conns, true);
+							    fwd_conns, true,
+							    fwd_src_net_cpu);
 					} else {
 						dump_result(result, "Reverse Target (RX)",
-							    rev_conns, false);
+							    rev_conns, false,
+							    rev_dst_net_cpu);
 					}
 					results_collected++;
 					free(result);
@@ -1102,10 +1320,12 @@ static int run_bidirectional(int src, int dst,
 				if (result && result->hdr.type == KPM_MSG_TYPE_TEST_RESULT) {
 					if (result->test_id == rev_src_tst_id) {
 						dump_result(result, "Reverse Source (TX)",
-							    rev_conns, true);
+							    rev_conns, true,
+							    rev_src_net_cpu);
 					} else {
 						dump_result(result, "Forward Target (RX)",
-							    fwd_conns, false);
+							    fwd_conns, false,
+							    fwd_dst_net_cpu);
 					}
 					results_collected++;
 					free(result);
@@ -1124,6 +1344,11 @@ out:
 	free(fwd_dst_wrk_id);
 	free(rev_src_wrk_id);
 	free(rev_dst_wrk_id);
+	free(steering_rule_locs);
+	free(fwd_src_net_cpu);
+	free(fwd_dst_net_cpu);
+	free(rev_src_net_cpu);
+	free(rev_dst_net_cpu);
 	return ret;
 }
 
@@ -1420,7 +1645,7 @@ int main(int argc, char *argv[])
 	else if (opt.output_csv)
 		dump_result_machine(result, "Source", conns, true);
 	else
-		dump_result(result, "Source", conns, true);
+		dump_result(result, "Source", conns, true, NULL);
 	free(result);
 
 	/* Stop the test on both ends */
@@ -1441,7 +1666,7 @@ int main(int argc, char *argv[])
 	else if (opt.output_csv)
 		dump_result_machine(result, "Source", conns, false);
 	else
-		dump_result(result, "Target", conns, false);
+		dump_result(result, "Target", conns, false, NULL);
 	free(result);
 
 out_id:
