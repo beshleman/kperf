@@ -17,6 +17,8 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/sysinfo.h>
+#include <fcntl.h>
+#include <limits.h>
 
 #include <ccan/array_size/array_size.h>
 #include <ccan/compiler/compiler.h>
@@ -69,6 +71,7 @@ struct worker {
 	unsigned int id;
 	int fd;
 	pid_t pid;
+	pthread_t thread;
 	int busy;
 	struct list_node workers;
 };
@@ -781,7 +784,7 @@ server_msg_pin_worker(struct session_state *self, struct kpm_header *hdr)
 		CPU_SET(req->cpu, &set);
 	}
 
-	if (sched_setaffinity(wrk->pid, sizeof(set), &set) < 0) {
+	if (pthread_setaffinity_np(wrk->thread, sizeof(set), &set) != 0) {
 		warn("Failed to pin worker to CPU");
 		kpm_reply_error(self->main_sock, hdr, errno);
 		return;
