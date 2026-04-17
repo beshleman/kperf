@@ -215,12 +215,6 @@ static void session_new_conn(struct session_state *self, int fd)
 	flags = id->flags;
 	free(id);
 
-	if (flags & KPM_CONNECT_FLAG_PSP) {
-		if (psp_exchange_keys(self, fd)) {
-			warn("Failed PSP exchange");
-			goto err_free;
-		}
-	}
 
 	list_add(&self->connections, &conn->connections);
 	return;
@@ -296,6 +290,273 @@ server_msg_tcp_acceptor(struct session_state *self, struct kpm_header *req)
 		self->quit = 1;
 		return;
 	}
+}
+
+static void
+server_msg_tcp_acceptor_ex(struct session_state *self, struct kpm_header *hdr)
+{
+	struct kpm_tcp_acceptor_ex *req;
+	struct epoll_event ev = {};
+	struct sockaddr_in6 addr;
+	socklen_t len;
+	int ret;
+
+	if (hdr->len < sizeof(*req)) {
+		warn("Invalid request in %s", __func__);
+		self->quit = 1;
+		return;
+	}
+	req = (void *)hdr;
+
+	if (self->tcp_sock) {
+		kpm_reply_error(self->main_sock, hdr, EBUSY);
+		return;
+	}
+
+	len = sizeof(addr);
+	if (getsockname(self->main_sock, (void *)&addr, &len)) {
+		warn("Failed to get sock type for main sock");
+		self->quit = 1;
+		return;
+	}
+	addr.sin6_port = htons(req->listen_port);
+
+	self->tcp_sock = socket(addr.sin6_family, SOCK_STREAM, 0);
+	if (self->tcp_sock < 0) {
+		warn("Failed to open socket");
+		self->quit = 1;
+		return;
+	}
+
+	int one = 1;
+	setsockopt(self->tcp_sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+	ret = bind(self->tcp_sock, (void *)&addr, sizeof(addr));
+	if (ret < 0) {
+		warn("Failed to bind socket to port %u", req->listen_port);
+		self->quit = 1;
+		return;
+	}
+
+	ret = listen(self->tcp_sock, 10);
+	if (ret < 0) {
+		warn("Failed to listen on socket");
+		self->quit = 1;
+		return;
+	}
+
+	len = sizeof(addr);
+	if (getsockname(self->tcp_sock, (void *)&addr, &len)) {
+		warn("Failed to get sock type for main sock");
+		self->quit = 1;
+		return;
+	}
+
+	ev.events = EPOLLIN | EPOLLET;
+	ev.data.fd = self->tcp_sock;
+	if (epoll_ctl(self->epollfd, EPOLL_CTL_ADD, self->tcp_sock, &ev) < 0) {
+		warn("Failed to add tcp sock to epoll");
+		self->quit = 1;
+		return;
+	}
+
+	if (kpm_reply_acceptor(self->main_sock, hdr, &addr, len) < 1) {
+		warn("Failed reply in %s", __func__);
+		self->quit = 1;
+		return;
+	}
+}
+
+static void
+server_msg_steering_rule(struct session_state *self, struct kpm_header *hdr)
+{
+	struct kpm_steering_rule *req;
+	struct kpm_steering_rule reply = {};
+	__s32 rule_loc = -1;
+	int ret;
+
+	if (hdr->len < sizeof(*req)) {
+		warn("Invalid request in %s", __func__);
+		self->quit = 1;
+		return;
+	}
+	req = (void *)hdr;
+
+	if (req->action == 0) {
+		/* Add rule */
+		ret = devmem_add_steering_rule(&req->addr, req->port,
+					       req->ifname, req->queue_id,
+					       req->match_is_dst, &rule_loc);
+		if (ret < 0) {
+			warnx("Failed to add steering rule");
+			kpm_reply_error(self->main_sock, hdr, EINVAL);
+			return;
+		}
+
+		/* Track for cleanup */
+		if (self->devmem.n_steering_rules < MAX_STEERING_RULES) {
+			self->devmem.steering_rule_locs[self->devmem.n_steering_rules++] = rule_loc;
+		}
+
+		reply.rule_loc = rule_loc;
+	} else {
+		/* Delete rule */
+		ret = devmem_del_steering_rule(req->ifname, req->rule_loc);
+		if (ret < 0) {
+			warnx("Failed to delete steering rule");
+			kpm_reply_error(self->main_sock, hdr, EINVAL);
+			return;
+		}
+		reply.rule_loc = req->rule_loc;
+	}
+
+	kpm_reply(self->main_sock, &reply.hdr, sizeof(reply), hdr);
+}
+
+static int get_pci_addr(const char *ifname, char *pci_addr, size_t len)
+{
+	char path[256];
+	char link[PATH_MAX];
+	ssize_t n;
+	char *slash;
+
+	snprintf(path, sizeof(path), "/sys/class/net/%s/device", ifname);
+	n = readlink(path, link, sizeof(link) - 1);
+	if (n < 0)
+		return -1;
+	link[n] = '\0';
+
+	slash = strrchr(link, '/');
+	if (slash)
+		slash++;
+	else
+		slash = link;
+
+	snprintf(pci_addr, len, "%s", slash);
+	return 0;
+}
+
+static int find_queue_irq(const char *ifname, unsigned int queue)
+{
+	char pci_addr[PATH_MAX] = {};
+	char needle[128];
+	char line[4096];
+	FILE *f;
+	int irq = -1;
+	int have_pci;
+
+	have_pci = (get_pci_addr(ifname, pci_addr, sizeof(pci_addr)) == 0);
+
+	f = fopen("/proc/interrupts", "r");
+	if (!f)
+		return -1;
+
+	while (fgets(line, sizeof(line), f)) {
+		char *p;
+
+		/* Pattern 1: mlx5_comp<queue>@pci:<pci_addr> */
+		if (have_pci) {
+			snprintf(needle, sizeof(needle),
+				 "mlx5_comp%u@pci:%s", queue, pci_addr);
+			p = strstr(line, needle);
+			if (p) {
+				char c = p[strlen(needle)];
+
+				if (c == '\n' || c == '\0' || c == ' ')
+					goto found;
+			}
+		}
+
+		/* Pattern 2: <ifname>-TxRx-<queue> */
+		snprintf(needle, sizeof(needle), "%s-TxRx-%u", ifname, queue);
+		p = strstr(line, needle);
+		if (p) {
+			char c = p[strlen(needle)];
+
+			if (c == '\n' || c == '\0' || c == ' ')
+				goto found;
+		}
+
+		/* Pattern 3: <ifname>-<queue> (generic) */
+		snprintf(needle, sizeof(needle), "%s-%u", ifname, queue);
+		p = strstr(line, needle);
+		if (p) {
+			char c = p[strlen(needle)];
+
+			if (c == '\n' || c == '\0' || c == ' ')
+				goto found;
+		}
+
+		continue;
+found:
+		irq = strtol(line, NULL, 10);
+		break;
+	}
+
+	fclose(f);
+	return irq;
+}
+
+static int set_irq_smp_affinity(const char *ifname, unsigned int queue,
+				unsigned int cpu)
+{
+	char path[256];
+	char cpu_str[32];
+	int irq, fd, ret;
+
+	irq = find_queue_irq(ifname, queue);
+	if (irq < 0) {
+		warnx("Could not find IRQ for %s queue %u in /proc/interrupts",
+		      ifname, queue);
+		return -1;
+	}
+
+	snprintf(path, sizeof(path), "/proc/irq/%d/smp_affinity_list", irq);
+	snprintf(cpu_str, sizeof(cpu_str), "%u", cpu);
+
+	fd = open(path, O_WRONLY);
+	if (fd < 0) {
+		warn("Failed to open %s", path);
+		return -1;
+	}
+
+	ret = write(fd, cpu_str, strlen(cpu_str));
+	close(fd);
+	if (ret < 0) {
+		warn("Failed to write IRQ affinity for %s queue %u (irq %d -> cpu %u)",
+		     ifname, queue, irq, cpu);
+		return -1;
+	}
+
+	warnx("Set IRQ %d (%s queue %u) -> CPU %u", irq, ifname, queue, cpu);
+	return 0;
+}
+
+static void
+server_msg_smp_affinity(struct session_state *self, struct kpm_header *hdr)
+{
+	struct kpm_smp_affinity *req;
+	unsigned int i;
+
+	if (hdr->len < sizeof(*req)) {
+		warn("Invalid request in %s", __func__);
+		self->quit = 1;
+		return;
+	}
+	req = (void *)hdr;
+
+	warnx("SMP affinity request: ifname=%s queue_start=%u queue_count=%u cpu_start=%u",
+	      req->ifname, req->queue_start, req->queue_count, req->cpu_start);
+
+	for (i = 0; i < req->queue_count; i++) {
+		if (set_irq_smp_affinity(req->ifname, req->queue_start + i,
+					 req->cpu_start + i) < 0) {
+			kpm_reply_error(self->main_sock, hdr, EINVAL);
+			return;
+		}
+	}
+
+	kpm_reply_empty(self->main_sock, hdr);
 }
 
 static void
@@ -999,6 +1260,15 @@ static void session_handle_main_sock(struct session_state *self)
 	case KPM_MSG_TYPE_END_TEST:
 		server_msg_end_test(self, hdr);
 		break;
+	case KPM_MSG_TYPE_OPEN_TCP_ACCEPTOR_EX:
+		server_msg_tcp_acceptor_ex(self, hdr);
+		break;
+	case KPM_MSG_TYPE_STEERING_RULE:
+		server_msg_steering_rule(self, hdr);
+		break;
+	case KPM_MSG_TYPE_SMP_AFFINITY:
+		server_msg_smp_affinity(self, hdr);
+		break;
 	default:
 		warnx("Unknown message type: %d", hdr->type);
 		self->quit = 1;
@@ -1182,6 +1452,11 @@ static void server_session_loop(int fd)
 		free(conn);
 	}
 
+	/* Clean up any steering rules we installed */
+	for (i = 0; i < (int)self.devmem.n_steering_rules; i++)
+		devmem_del_steering_rule(self.devmem.ifname,
+					 self.devmem.steering_rule_locs[i]);
+
 	if (self.tcp_sock && self.rx_mode == KPM_RX_MODE_DEVMEM)
 		devmem_teardown(&self.devmem);
 	if (!self.tcp_sock && self.tx_mode == KPM_TX_MODE_DEVMEM)
@@ -1189,8 +1464,6 @@ static void server_session_loop(int fd)
 	if (self.tcp_sock && self.iou && self.rx_mode == KPM_RX_MODE_SOCKET_ZEROCOPY)
 		iou_zerocopy_rx_teardown(&self.iou_state);
 
-	if (self.psp)
-		ynl_sock_destroy(self.psp);
 }
 
 static NORETURN void server_session(int fd)

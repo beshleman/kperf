@@ -213,8 +213,8 @@ int kpm_send_pin_worker(int fd, __u32 id, __u32 cpu)
 	return kpm_send(fd, &msg.hdr, sizeof(msg), KPM_MSG_TYPE_PIN_WORKER);
 }
 
-static int kpm_reply(int fd, struct kpm_header *msg, size_t size,
-		     struct kpm_header *req)
+int kpm_reply(int fd, struct kpm_header *msg, size_t size,
+	      struct kpm_header *req)
 {
 	return __kpm_send(fd, msg, size, req->id, req->type | KPM_MSG_REPLY);
 }
@@ -525,6 +525,106 @@ int kpm_req_disconnect(int fd, __u32 connection_id)
 
 	if (!kpm_good_reply(repl, KPM_MSG_TYPE_DISCONNECT, id)) {
 		warnx("Failed to end connection - bad reply");
+		free(repl);
+		return -1;
+	}
+
+	free(repl);
+	return 0;
+}
+
+int kpm_req_tcp_sock_ex(int fd, __u16 listen_port,
+			struct sockaddr_in6 *addr, socklen_t *len)
+{
+	struct kpm_tcp_acceptor_reply *repl;
+	struct kpm_tcp_acceptor_ex msg = {};
+	int id;
+
+	msg.listen_port = listen_port;
+
+	id = kpm_send(fd, &msg.hdr, sizeof(msg),
+		      KPM_MSG_TYPE_OPEN_TCP_ACCEPTOR_EX);
+	if (id < 0) {
+		warnx("Failed to request TCP sock ex");
+		return id;
+	}
+
+	repl = kpm_receive(fd);
+	if (!repl) {
+		warnx("Failed to request TCP sock ex - no response");
+		return -1;
+	}
+
+	if (!kpm_good_reply(repl, KPM_MSG_TYPE_OPEN_TCP_ACCEPTOR_EX, id)) {
+		warnx("Failed to request TCP sock ex - unexpected reply");
+		free(repl);
+		return -1;
+	}
+
+	if (*len < repl->len) {
+		warnx("Failed to request TCP sock ex - req space small");
+		free(repl);
+		return -1;
+	}
+
+	memcpy(addr, &repl->addr, repl->len);
+	*len = repl->len;
+	free(repl);
+	return 0;
+}
+
+int kpm_req_steering_rule(int fd, struct kpm_steering_rule *rule,
+			  __s32 *out_rule_loc)
+{
+	struct kpm_steering_rule *repl;
+	int id;
+
+	id = kpm_send(fd, &rule->hdr, sizeof(*rule),
+		      KPM_MSG_TYPE_STEERING_RULE);
+	if (id < 0) {
+		warnx("Failed to send steering rule");
+		return id;
+	}
+
+	repl = kpm_receive(fd);
+	if (!repl) {
+		warnx("Failed to send steering rule - no response");
+		return -1;
+	}
+
+	if (!kpm_good_reply(repl, KPM_MSG_TYPE_STEERING_RULE, id)) {
+		warnx("Failed to send steering rule - bad reply");
+		free(repl);
+		return -1;
+	}
+
+	if (out_rule_loc)
+		*out_rule_loc = repl->rule_loc;
+
+	free(repl);
+	return 0;
+}
+
+int kpm_req_smp_affinity(int fd, struct kpm_smp_affinity *aff)
+{
+	struct kpm_empty *repl;
+	int id;
+
+	id = kpm_send(fd, &aff->hdr, sizeof(*aff),
+		      KPM_MSG_TYPE_SMP_AFFINITY);
+	if (id < 0) {
+		warnx("Failed to send SMP affinity");
+		return id;
+	}
+
+	repl = kpm_receive(fd);
+	if (!repl) {
+		warnx("Failed to send SMP affinity - no response");
+		return -1;
+	}
+
+	if (!kpm_good_reply(repl, KPM_MSG_TYPE_SMP_AFFINITY, id)) {
+		warnx("Failed to send SMP affinity - bad reply");
 		free(repl);
 		return -1;
 	}
