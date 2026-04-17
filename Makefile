@@ -19,7 +19,8 @@ LIBS += -L$(YNL_PATH) -lynl
 LIBS += $(LIBURING_PATH)/src/liburing.a
 
 ifdef USE_CUDA
-    CFLAGS += -I/usr/local/cuda/include/ -DUSE_CUDA
+    CUDA_DIR ?= /usr/local/cuda
+    CFLAGS += -I$(CUDA_DIR)/include/ -DUSE_CUDA
 endif
 
 include $(wildcard *.d)
@@ -28,7 +29,8 @@ all: server client units
 units: bipartite_match cpu_stat
 
 ifdef USE_CUDA
-server: LIBS += -lcuda -lcudart -L/usr/local/cuda/lib64
+CUDA_STUB_DIR ?= /usr/local/fbcode/platform010/lib/cuda-no-rpath-12.8/stubs
+server: LIBS += -lcuda -lcudart -L$(CUDA_DIR)/lib64 -L$(CUDA_STUB_DIR)
 endif
 
 server: $(CCAN_PATH)/libccan.a $(YNL_PATH)/libynl.a $(LIBURING_PATH)/src/liburing.a server.o server_session.o proto.o epoll.o iou.o worker.o devmem.o cpu_stat.o tcp.o
