@@ -68,6 +68,7 @@ static struct {
 	bool iou_dst;
 	bool zerocopy_rx;
 	unsigned int iou_rx_size_mb;
+	bool iou_tx_dmabuf;
 } opt = {
 	.tls_ver = TLS_1_3_VERSION,
 	.src = "localhost",
@@ -284,6 +285,8 @@ static const struct opt_table opts[] = {
 			"Use io_uring on source server"),
 	OPT_WITHOUT_ARG("--iou-dst", opt_set_bool, &opt.iou_dst,
 			"Use io_uring on destination server"),
+	OPT_WITHOUT_ARG("--iou-tx-dmabuf", opt_set_bool, &opt.iou_tx_dmabuf,
+			"Use io_uring TX dmabuf zero-copy send (requires --iou-src)"),
 	OPT_EARLY_WITHOUT_ARG("--zerocopy-rx", opt_set_bool, &opt.zerocopy_rx,
 			      "Use zero copy on receive"),
 	OPT_WITH_ARG("--iou-rx-size-mb <arg>", opt_set_uintval, opt_show_uintval,
@@ -733,6 +736,7 @@ int main(int argc, char *argv[])
 	struct sockaddr_in6 conn_addr;
 	__u32 src_tst_id, dst_tst_id;
 	struct sockaddr_in6 src_addr;
+	struct sockaddr_in6 dst_addr;
 	struct addrinfo *addr;
 	struct kpm_test *test;
 	unsigned int i;
@@ -771,6 +775,9 @@ int main(int argc, char *argv[])
 	if (inet_sockaddr(opt.src, &src_addr) < 0)
 		errx(1, "failed to get sockaddr from %s\n", opt.src);
 
+	if (inet_sockaddr(opt.dst, &dst_addr) < 0)
+		errx(1, "failed to get sockaddr from %s\n", opt.dst);
+
 	/* io_uring doesn't support devmem yet */
 	if (opt.devmem_rx && opt.iou_dst)
 		errx(1, "io_uring does not support --devmem-rx yet");
@@ -793,7 +800,14 @@ int main(int argc, char *argv[])
 	if (opt.msg_zerocopy && opt.devmem_tx)
 		errx(1, "--msg-zerocopy and --devmem-tx are mutually exclusive");
 
-	if (opt.msg_zerocopy)
+	if (opt.iou_tx_dmabuf && !opt.iou_src)
+		errx(1, "--iou-tx-dmabuf requires --iou-src");
+	if (opt.iou_tx_dmabuf && (opt.devmem_tx || opt.msg_zerocopy))
+		errx(1, "--iou-tx-dmabuf is mutually exclusive with --devmem-tx and --msg-zerocopy");
+
+	if (opt.iou_tx_dmabuf)
+		tx_mode = KPM_TX_MODE_IOU_DMABUF;
+	else if (opt.msg_zerocopy)
 		tx_mode = KPM_TX_MODE_SOCKET_ZEROCOPY;
 	else if (opt.devmem_tx)
 		tx_mode = KPM_TX_MODE_DEVMEM;
@@ -845,6 +859,7 @@ int main(int argc, char *argv[])
 		.dmabuf_rx_size_mb = opt.dmabuf_rx_size_mb,
 		.dmabuf_tx_size_mb = opt.dmabuf_tx_size_mb,
 		.num_rx_queues = opt.num_rx_queues,
+		.addr = dst_addr,
 		.validate = opt.validate,
 		.iou = opt.iou_dst,
 		.iou_rx_size_mb = opt.iou_rx_size_mb,
