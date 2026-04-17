@@ -10,6 +10,11 @@ int reserve_queues(int fd, int num_queues, char out_ifname[IFNAMSIZ],
 		   int *out_ifindex, int *out_queue_id, int *out_rss_context);
 void unreserve_queues(char *ifname, int rss_context);
 
+int devmem_add_steering_rule(struct sockaddr_in6 *addr, __u16 port,
+			     const char *ifname, int queue_id,
+			     bool match_is_dst, __s32 *out_rule_loc);
+int devmem_del_steering_rule(const char *ifname, int rule_loc);
+
 int devmem_setup(struct session_state_devmem *devmem, int fd,
 		 size_t dmabuf_size, int num_queues,
 		 enum memory_provider_type provider, struct pci_dev *dev);
@@ -24,6 +29,10 @@ void devmem_teardown_conn(struct connection_devmem *devmem);
 int devmem_prepare_connect(int fd, struct sockaddr_in6 *src, struct session_state_devmem *devmem);
 int devmem_setup_tx(struct session_state_devmem *devmem, enum memory_provider_type provider,
 		    int dmabuf_tx_size_mb, struct pci_dev *dev, struct sockaddr_in6 *addr);
+int devmem_setup_tx_iou(struct session_state_devmem *devmem,
+			enum memory_provider_type provider,
+			int dmabuf_tx_size_mb, struct pci_dev *dev,
+			struct sockaddr_in6 *addr, int *out_ifindex);
 int devmem_bind_socket(struct session_state_devmem *devmem, int fd);
 
 #endif /* DEVMEM_H */

@@ -116,40 +116,67 @@ free_rules:
 	return -1;
 }
 
-static int add_steering_rule(struct sockaddr_in6 *server_sin,
-			     const char *ifname, int rss_context)
+static int __add_steering_rule(struct sockaddr_in6 *sin,
+			       const char *ifname, int rss_context,
+			       int direct_queue, bool match_is_dst,
+			       __s32 *out_rule_loc)
 {
 	struct ethtool_rxnfc add = {};
 	struct ethtool_rxnfc cnt = {};
 	int ret;
 
 	add.cmd = ETHTOOL_SRXCLSRLINS;
-	add.rss_context = rss_context;
-
-	if (IN6_IS_ADDR_V4MAPPED(&server_sin->sin6_addr)) {
-		add.fs.flow_type = TCP_V4_FLOW;
-                memcpy(&add.fs.h_u.tcp_ip4_spec.ip4dst,
-                       &server_sin->sin6_addr.s6_addr32[3], 4);
-                memcpy(&add.fs.h_u.tcp_ip4_spec.pdst,
-		       &server_sin->sin6_port, 2);
-
-		add.fs.m_u.tcp_ip4_spec.ip4dst = 0xffffffff;
-		add.fs.m_u.tcp_ip4_spec.pdst = 0xffff;
+	if (direct_queue >= 0) {
+		add.fs.ring_cookie = direct_queue;
+		add.rss_context = 0;
 	} else {
-		add.fs.flow_type = TCP_V6_FLOW;
-                memcpy(add.fs.h_u.tcp_ip6_spec.ip6dst, &server_sin->sin6_addr,
-                       16);
-                memcpy(&add.fs.h_u.tcp_ip6_spec.pdst, &server_sin->sin6_port,
-                       2);
-
-                add.fs.m_u.tcp_ip6_spec.ip6dst[0] = 0xffffffff;
-		add.fs.m_u.tcp_ip6_spec.ip6dst[1] = 0xffffffff;
-		add.fs.m_u.tcp_ip6_spec.ip6dst[2] = 0xffffffff;
-		add.fs.m_u.tcp_ip6_spec.ip6dst[3] = 0xffffffff;
-		add.fs.m_u.tcp_ip6_spec.pdst = 0xffff;
+		add.rss_context = rss_context;
 	}
 
-	add.fs.flow_type |= FLOW_RSS;
+	if (IN6_IS_ADDR_V4MAPPED(&sin->sin6_addr)) {
+		add.fs.flow_type = TCP_V4_FLOW;
+		if (match_is_dst) {
+			memcpy(&add.fs.h_u.tcp_ip4_spec.ip4dst,
+			       &sin->sin6_addr.s6_addr32[3], 4);
+			memcpy(&add.fs.h_u.tcp_ip4_spec.pdst,
+			       &sin->sin6_port, 2);
+			add.fs.m_u.tcp_ip4_spec.ip4dst = 0xffffffff;
+			add.fs.m_u.tcp_ip4_spec.pdst = 0xffff;
+		} else {
+			memcpy(&add.fs.h_u.tcp_ip4_spec.ip4src,
+			       &sin->sin6_addr.s6_addr32[3], 4);
+			memcpy(&add.fs.h_u.tcp_ip4_spec.psrc,
+			       &sin->sin6_port, 2);
+			add.fs.m_u.tcp_ip4_spec.ip4src = 0xffffffff;
+			add.fs.m_u.tcp_ip4_spec.psrc = 0xffff;
+		}
+	} else {
+		add.fs.flow_type = TCP_V6_FLOW;
+		if (match_is_dst) {
+			memcpy(add.fs.h_u.tcp_ip6_spec.ip6dst,
+			       &sin->sin6_addr, 16);
+			memcpy(&add.fs.h_u.tcp_ip6_spec.pdst,
+			       &sin->sin6_port, 2);
+			add.fs.m_u.tcp_ip6_spec.ip6dst[0] = 0xffffffff;
+			add.fs.m_u.tcp_ip6_spec.ip6dst[1] = 0xffffffff;
+			add.fs.m_u.tcp_ip6_spec.ip6dst[2] = 0xffffffff;
+			add.fs.m_u.tcp_ip6_spec.ip6dst[3] = 0xffffffff;
+			add.fs.m_u.tcp_ip6_spec.pdst = 0xffff;
+		} else {
+			memcpy(add.fs.h_u.tcp_ip6_spec.ip6src,
+			       &sin->sin6_addr, 16);
+			memcpy(&add.fs.h_u.tcp_ip6_spec.psrc,
+			       &sin->sin6_port, 2);
+			add.fs.m_u.tcp_ip6_spec.ip6src[0] = 0xffffffff;
+			add.fs.m_u.tcp_ip6_spec.ip6src[1] = 0xffffffff;
+			add.fs.m_u.tcp_ip6_spec.ip6src[2] = 0xffffffff;
+			add.fs.m_u.tcp_ip6_spec.ip6src[3] = 0xffffffff;
+			add.fs.m_u.tcp_ip6_spec.psrc = 0xffff;
+		}
+	}
+
+	if (direct_queue < 0)
+		add.fs.flow_type |= FLOW_RSS;
 
 	cnt.cmd = ETHTOOL_GRXCLSRLCNT;
 	ret = ethtool(ifname, &cnt);
@@ -171,9 +198,44 @@ static int add_steering_rule(struct sockaddr_in6 *server_sin,
 	if (ret)
 		return ret;
 
-	steering_rule_loc = add.fs.location;
+	if (out_rule_loc)
+		*out_rule_loc = add.fs.location;
+	else
+		steering_rule_loc = add.fs.location;
 
 	return 0;
+}
+
+static int add_steering_rule(struct sockaddr_in6 *server_sin,
+			     const char *ifname, int rss_context)
+{
+	return __add_steering_rule(server_sin, ifname, rss_context,
+				  -1, true, NULL);
+}
+
+int devmem_del_steering_rule(const char *ifname, int rule_loc)
+{
+	struct ethtool_rxnfc del = {};
+
+	if (rule_loc < 0)
+		return -1;
+
+	del.cmd = ETHTOOL_SRXCLSRLDEL;
+	del.fs.location = rule_loc;
+
+	return ethtool(ifname, &del);
+}
+
+int devmem_add_steering_rule(struct sockaddr_in6 *addr, __u16 port,
+			     const char *ifname, int queue_id,
+			     bool match_is_dst, __s32 *out_rule_loc)
+{
+	struct sockaddr_in6 sin = *addr;
+
+	sin.sin6_port = port;
+
+	return __add_steering_rule(&sin, ifname, 0, queue_id,
+				   match_is_dst, out_rule_loc);
 }
 
 static int rss_context_delete(char *ifname, int rss_context)
@@ -1173,6 +1235,49 @@ sock_destroy:
 	ynl_sock_destroy(devmem->ys);
 	devmem->ys = NULL;
 	return ret;
+}
+
+int devmem_setup_tx_iou(struct session_state_devmem *devmem,
+			enum memory_provider_type provider,
+			int dmabuf_tx_size_mb, struct pci_dev *dev,
+			struct sockaddr_in6 *addr, int *out_ifindex)
+{
+	char ifname[IFNAMSIZ] = {};
+	int ifindex;
+
+	devmem->tx_provider = provider;
+	devmem->dmabuf_tx_size_mb = dmabuf_tx_size_mb;
+	memcpy(&devmem->tx_dev, dev, sizeof(devmem->tx_dev));
+	memcpy(&devmem->addr, addr, sizeof(devmem->addr));
+
+	txmp = get_memory_provider(devmem->tx_provider);
+	if (!txmp)
+		return -1;
+
+	if (txmp->dev_init && txmp->dev_init(&devmem->tx_dev) < 0)
+		return -1;
+
+	devmem->tx_mem = txmp->alloc(devmem->dmabuf_tx_size_mb * 1024 * 1024);
+	if (!devmem->tx_mem) {
+		warnx("Failed to allocate devmem tx buffer");
+		return -1;
+	}
+
+	{
+		size_t copy_len = sizeof(patbuf);
+		if (copy_len > devmem->tx_mem->size)
+			copy_len = devmem->tx_mem->size;
+		txmp->memcpy_to_device(devmem->tx_mem, 0, patbuf, copy_len);
+	}
+
+	ifindex = find_iface(&devmem->addr, ifname);
+	if (ifindex < 0) {
+		warnx("Failed to resolve ifindex: %s", strerror(-ifindex));
+		return -1;
+	}
+
+	*out_ifindex = ifindex;
+	return 0;
 }
 
 void devmem_teardown_tx(struct session_state_devmem *devmem)
