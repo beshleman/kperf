@@ -24,6 +24,22 @@ extern unsigned char patbuf[KPM_MAX_OP_CHUNK + PATTERN_PERIOD + 1];
 
 static long page_size;
 
+#ifndef IORING_REGISTER_TX_DMABUF_AREA
+#define IORING_REGISTER_TX_DMABUF_AREA	35
+#endif
+
+#ifndef IORING_SEND_TX_DMABUF
+#define IORING_SEND_TX_DMABUF	(1U << 6)
+#endif
+
+struct io_uring_zctx_area_reg {
+	__u32	if_idx;
+	__u32	dmabuf_fd;
+	__u32	flags;
+	__u32	area_id;
+	__u64	__resv[3];
+};
+
 struct iou_state {
 	struct io_uring ring;
 	void *area_ptr;
@@ -34,6 +50,7 @@ struct iou_state {
 	size_t rq_size;
 	unsigned rq_mask;
 	__u32 zcrx_id;
+	__u32 tx_area_id;
 };
 
 struct iou_kpm_msg_state {
@@ -109,6 +126,23 @@ static void iou_conn_add_sendzc(struct io_uring *ring, struct worker_connection 
 	io_uring_sqe_set_data(sqe, tag(conn, IOU_REQ_TYPE_SENDZC));
 }
 
+static void iou_conn_add_send_dmabuf(struct io_uring *ring,
+				     struct worker_connection *conn,
+				     struct iou_state *state)
+{
+	struct io_uring_sqe *sqe;
+	size_t chunk, off;
+
+	chunk = min_t(size_t, conn->write_size, conn->to_send);
+	off = conn->tot_sent % PATTERN_PERIOD;
+
+	sqe = io_uring_get_sqe(ring);
+	io_uring_prep_send_zc(sqe, conn->fd, (void *)(uintptr_t)off, chunk, 0, 0);
+	sqe->ioprio |= IORING_SEND_TX_DMABUF;
+	sqe->file_index = state->tx_area_id;
+	io_uring_sqe_set_data(sqe, tag(conn, IOU_REQ_TYPE_SENDZC));
+}
+
 static void iou_handle_send(struct worker_state *self, struct io_uring_cqe *cqe)
 {
 	struct worker_connection *conn;
@@ -163,6 +197,8 @@ static void iou_handle_sendzc(struct worker_state *self, struct io_uring_cqe *cq
 
 	if (!conn->to_send)
 		worker_send_finished(self, conn);
+	else if (self->opts.tx_mode == KPM_TX_MODE_IOU_DMABUF)
+		iou_conn_add_send_dmabuf(get_ring(self), conn, get_iou_state(self));
 	else
 		iou_conn_add_sendzc(get_ring(self), conn);
 }
@@ -378,6 +414,27 @@ static int iou_register_zerocopy_tx(struct worker_state *self)
 	return io_uring_register_buffers(&state->ring, &iov, 1);
 }
 
+static int iou_register_tx_dmabuf(struct worker_state *self)
+{
+	struct iou_state *state = get_iou_state(self);
+	struct io_uring_zctx_area_reg reg = {
+		.if_idx = self->opts.iou.ifindex,
+		.dmabuf_fd = self->opts.iou.dmabuf_fd,
+	};
+	int ret;
+
+	ret = io_uring_register(state->ring.ring_fd,
+				IORING_REGISTER_TX_DMABUF_AREA,
+				&reg, 1);
+	if (ret < 0) {
+		warnx("IORING_REGISTER_TX_DMABUF_AREA failed: %d", ret);
+		return ret;
+	}
+
+	state->tx_area_id = reg.area_id;
+	return 0;
+}
+
 static void iou_prep(struct worker_state *self)
 {
 	struct iou_kpm_msg_state *msg;
@@ -418,6 +475,10 @@ static void iou_prep(struct worker_state *self)
 	if (self->opts.tx_mode == KPM_TX_MODE_SOCKET_ZEROCOPY)
 		if (iou_register_zerocopy_tx(self))
 			err(8, "Failed to register zero copy tx");
+
+	if (self->opts.tx_mode == KPM_TX_MODE_IOU_DMABUF)
+		if (iou_register_tx_dmabuf(self))
+			err(8, "Failed to register TX dmabuf area");
 
 	sqe = io_uring_get_sqe(&state->ring);
 	io_uring_prep_recv(sqe, self->main_sock, &msg->hdr, sizeof(msg->hdr), MSG_PEEK | MSG_WAITALL);
@@ -555,7 +616,9 @@ static void iou_conn_add(struct worker_state *state, struct worker_connection *c
 	struct io_uring *ring = get_ring(state);
 
 	if (conn->to_send) {
-		if (state->opts.tx_mode == KPM_TX_MODE_SOCKET_ZEROCOPY)
+		if (state->opts.tx_mode == KPM_TX_MODE_IOU_DMABUF)
+			iou_conn_add_send_dmabuf(ring, conn, get_iou_state(state));
+		else if (state->opts.tx_mode == KPM_TX_MODE_SOCKET_ZEROCOPY)
 			iou_conn_add_sendzc(ring, conn);
 		else
 			iou_conn_add_send(ring, conn);

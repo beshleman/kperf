@@ -124,6 +124,7 @@ struct worker_state_iou {
 	unsigned int rx_size_mb;
 	int ifindex;
 	int queue_id;
+	int dmabuf_fd;
 };
 
 struct worker_opts {

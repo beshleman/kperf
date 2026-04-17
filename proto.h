@@ -167,6 +167,7 @@ enum kpm_tx_mode {
 	KPM_TX_MODE_SOCKET,
 	KPM_TX_MODE_SOCKET_ZEROCOPY,
 	KPM_TX_MODE_DEVMEM,
+	KPM_TX_MODE_IOU_DMABUF,
 };
 
 enum memory_provider_type {
