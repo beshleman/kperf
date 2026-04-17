@@ -333,7 +333,8 @@ server_msg_connect(struct session_state *self, struct kpm_header *hdr)
 		goto err_close;
 	}
 
-	if (self->tx_mode == KPM_TX_MODE_DEVMEM &&
+	if ((self->tx_mode == KPM_TX_MODE_DEVMEM ||
+	     self->tx_mode == KPM_TX_MODE_IOU_DMABUF) &&
 	    devmem_bind_socket(&self->devmem, cfd) < 0)
 		goto err_close;
 
@@ -651,6 +652,20 @@ server_msg_mode(struct session_state *self, struct kpm_header *hdr)
 		}
 	}
 
+	if (!self->tcp_sock && (req->tx_mode == KPM_TX_MODE_IOU_DMABUF)) {
+		int ifindex;
+
+		ret = devmem_setup_tx_iou(&self->devmem, req->tx_provider,
+					  req->dmabuf_tx_size_mb, &req->dev,
+					  &req->addr, &ifindex);
+		if (ret < 0) {
+			warnx("Failed to setup io_uring TX dmabuf");
+			self->quit = 1;
+			return;
+		}
+		self->iou_state.ifindex = ifindex;
+	}
+
 	if (kpm_reply_empty(self->main_sock, hdr) < 1) {
 		warnx("Reply failed");
 		goto err_quit;
@@ -707,6 +722,7 @@ server_msg_spawn_worker(struct session_state *self, struct kpm_header *hdr)
 	opts->iou.rx_size_mb = self->iou_state.rx_size_mb;
 	opts->iou.ifindex = self->iou_state.ifindex;
 	opts->iou.queue_id = self->iou_state.queue_id;
+	opts->iou.dmabuf_fd = self->devmem.tx_mem ? self->devmem.tx_mem->fd : -1;
 	if (pthread_create(&thread, &attr, worker_main, opts) != 0) {
 		warnx("Failed to create worker thread");
 		free(opts);
@@ -1180,7 +1196,8 @@ static void server_session_loop(int fd)
 
 	if (self.tcp_sock && self.rx_mode == KPM_RX_MODE_DEVMEM)
 		devmem_teardown(&self.devmem);
-	if (!self.tcp_sock && self.tx_mode == KPM_TX_MODE_DEVMEM)
+	if (!self.tcp_sock && (self.tx_mode == KPM_TX_MODE_DEVMEM ||
+			      self.tx_mode == KPM_TX_MODE_IOU_DMABUF))
 		devmem_teardown_tx(&self.devmem);
 	if (self.tcp_sock && self.iou && self.rx_mode == KPM_RX_MODE_SOCKET_ZEROCOPY)
 		iou_zerocopy_rx_teardown(&self.iou_state);
