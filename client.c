@@ -935,7 +935,7 @@ int main(int argc, char *argv[])
 
 		if (opt.xpin)
 			dst_wrk_cpu[i] = conns[!i].remote.cpu;
-		if (opt.cpu_dst_wrk != -1)
+		else if (opt.cpu_dst_wrk != -1)
 			dst_wrk_cpu[i] = opt.cpu_dst_wrk;
 		else
 			dst_wrk_cpu[i] = id->remote.cpu + opt.pin_off;
