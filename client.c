@@ -492,7 +492,7 @@ show_cpu_stat(const char *pfx, struct kpm_test_results *result, unsigned int id)
 
 static void
 dump_result(struct kpm_test_results *result,
-	    struct kpm_connect_reply *conns, bool local)
+	    struct kpm_connect_reply *conns, __u32 *wrk_cpu, bool local)
 {
 	unsigned int end = 0, i, r;
 	int start = -1;
@@ -525,12 +525,14 @@ dump_result(struct kpm_test_results *result,
 		      result->res[r].snd_wnd, result->res[r].snd_cwnd);
 
 	for (r = 0; r < opt.n_conns; r++) {
+		bool flow_cpu_differs;
 		int flow_cpu;
 
 		flow_cpu = local ? conns[r].local.cpu : conns[r].remote.cpu;
-		show_cpu_stat(opt.pin_off ? "net " : "", result, flow_cpu);
-		if (opt.pin_off)
-			show_cpu_stat("app ", result, flow_cpu + opt.pin_off);
+		flow_cpu_differs = wrk_cpu[r] != (unsigned int)flow_cpu;
+		show_cpu_stat(flow_cpu_differs ? "net " : "", result, flow_cpu);
+		if (flow_cpu_differs)
+			show_cpu_stat("app ", result, wrk_cpu[r]);
 	}
 
 	/* The rest is RR-only */
@@ -587,10 +589,11 @@ dump_result(struct kpm_test_results *result,
 
 static void
 dump_result_machine(struct kpm_test_results *result,
-		    struct kpm_connect_reply *conns, bool local)
+		    struct kpm_connect_reply *conns, __u32 *wrk_cpu, bool local)
 {
 	struct kpm_test_result res = {};
 	struct kpm_cpu_load *cpu;
+	bool flow_cpu_differs;
 	unsigned int r;
 	int flow_cpu;
 	__u64 bytes;
@@ -631,6 +634,13 @@ dump_result_machine(struct kpm_test_results *result,
 	res.p9999 /= opt.n_conns;
 	r = 0;
 
+
+	if (local)
+		flow_cpu = conns[0].local.cpu;
+	else
+		flow_cpu = conns[0].remote.cpu;
+	flow_cpu_differs = wrk_cpu[0] != (unsigned int)flow_cpu;
+
 	/* Headers once on the first line */
 	if (local && opt.output_hdr) {
 		for (i = 0; i < 2; i++) {
@@ -639,7 +649,7 @@ dump_result_machine(struct kpm_test_results *result,
 				printf("latency,(us),,,,,");
 			if (opt.n_conns < 2) {
 				printf("net,,,,");
-				if (opt.pin_off)
+				if (flow_cpu_differs)
 					printf("app,,,,");
 			}
 			printf("data%c", i ? '\n' : ',');
@@ -650,7 +660,7 @@ dump_result_machine(struct kpm_test_results *result,
 				printf("p25,p50,p90,p99,p999,p9999,");
 			if (opt.n_conns < 2) {
 				printf("usr,sys,idle,sirq,");
-				if (opt.pin_off)
+				if (flow_cpu_differs)
 					printf("usr,sys,idle,sirq,");
 			}
 			printf(i ? "rx\n" : "tx,");
@@ -669,14 +679,17 @@ dump_result_machine(struct kpm_test_results *result,
 
 	/* Dunno how to report CPU use, yet */
 	if (opt.n_conns < 2) {
-		flow_cpu = local ? conns[r].local.cpu : conns[r].remote.cpu;
+		if (local)
+			flow_cpu = conns[r].local.cpu;
+		else
+			flow_cpu = conns[r].remote.cpu;
 		cpu = &result->cpu_load[flow_cpu];
 		printf("%.4f,%.4f,%.4f,%.4f,",
 		       cpu->user / 10000.0, cpu->system / 10000.0,
 		       cpu->idle / 10000.0, cpu->sirq / 10000.0);
 
-		if (opt.pin_off) {
-			cpu = &result->cpu_load[flow_cpu + opt.pin_off];
+		if (flow_cpu_differs) {
+			cpu = &result->cpu_load[wrk_cpu[r]];
 			printf("%.4f,%.4f,%.4f,%.4f,",
 			       cpu->user / 10000.0, cpu->system / 10000.0,
 			       cpu->idle / 10000.0, cpu->sirq / 10000.0);
@@ -996,9 +1009,9 @@ int main(int argc, char *argv[])
 		warnx("Invalid result %d %d",
 		      result->hdr.type, result->hdr.len);
 	else if (opt.output_csv)
-		dump_result_machine(result, conns, true);
+		dump_result_machine(result, conns, src_wrk_cpu, true);
 	else
-		dump_result(result, conns, true);
+		dump_result(result, conns, src_wrk_cpu, true);
 	free(result);
 
 	/* Stop the test on both ends */
@@ -1017,9 +1030,9 @@ int main(int argc, char *argv[])
 		warnx("Invalid result %d %d",
 		      result->hdr.type, result->hdr.len);
 	else if (opt.output_csv)
-		dump_result_machine(result, conns, false);
+		dump_result_machine(result, conns, dst_wrk_cpu, false);
 	else
-		dump_result(result, conns, false);
+		dump_result(result, conns, dst_wrk_cpu, false);
 	free(result);
 
 out_id:
