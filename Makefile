@@ -18,8 +18,12 @@ LIBS=-lm -L$(CCAN_PATH) -pthread -lccan
 LIBS += -L$(YNL_PATH) -lynl
 LIBS += $(LIBURING_PATH)/src/liburing.a
 
+CUDA_PATH ?= /usr/local/cuda
+CUDA_INCLUDE_PATH ?= $(CUDA_PATH)/include
+CUDA_LIB_PATH ?= $(CUDA_PATH)/lib64
+
 ifdef USE_CUDA
-    CFLAGS += -I/usr/local/cuda/include/ -DUSE_CUDA
+    CFLAGS += -I$(CUDA_INCLUDE_PATH) -DUSE_CUDA
 endif
 
 include $(wildcard *.d)
@@ -28,7 +32,7 @@ all: server client units
 units: bipartite_match cpu_stat
 
 ifdef USE_CUDA
-server: LIBS += -lcuda -lcudart -L/usr/local/cuda/lib64
+server: LIBS += -L$(CUDA_LIB_PATH) -lcuda -lcudart
 endif
 
 server: $(CCAN_PATH)/libccan.a $(YNL_PATH)/libynl.a $(LIBURING_PATH)/src/liburing.a server.o server_session.o proto.o epoll.o iou.o worker.o devmem.o cpu_stat.o tcp.o
