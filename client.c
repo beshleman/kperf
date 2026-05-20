@@ -869,10 +869,6 @@ int main(int argc, char *argv[])
 		.iou = opt.iou_dst,
 		.iou_rx_size_mb = opt.iou_rx_size_mb,
 	};
-	if (kpm_req_mode(dst, &dst_mode) < 0) {
-		warnx("Failed setup destination mode");
-		goto out;
-	}
 
 	struct kpm_mode src_mode = {
 		.rx_mode = rx_mode,
@@ -889,6 +885,16 @@ int main(int argc, char *argv[])
 		.iou = opt.iou_src,
 		.iou_rx_size_mb = opt.iou_rx_size_mb,
 	};
+
+	/*
+	 * src mode first: server_msg_connect later does devmem_bind_socket(cfd)
+	 * for tx, which needs the tx dmabuf pool already allocated.
+	 *
+	 * dst mode must be deferred until AFTER spawn_conn completes the
+	 * CONNECTION_ID handshake: once devmem_setup installs the RSS steering
+	 * rule for dst:port, all subsequent RX on those accepted sockets lands
+	 * in devmem queues and plain recv() returns EFAULT.
+	 */
 	if (kpm_req_mode(src, &src_mode) < 0) {
 		warnx("Failed setup source mode");
 		goto out;
@@ -897,6 +903,11 @@ int main(int argc, char *argv[])
 	conns = spawn_conn(src, dst, &conn_addr, len);
 	if (!conns)
 		goto out;
+
+	if (kpm_req_mode(dst, &dst_mode) < 0) {
+		warnx("Failed setup destination mode");
+		goto out_id;
+	}
 
 	if (opt.tls || opt.tls_rx || opt.tls_tx) {
 		struct tls12_crypto_info_aes_gcm_128 aes128 = {};
