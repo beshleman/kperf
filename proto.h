@@ -168,6 +168,10 @@ struct kpm_mode {
 	__u32 dmabuf_rx_size_mb;
 	__u32 dmabuf_tx_size_mb;
 	__u32 num_rx_queues;
+	/* RX buffer size (bytes) per net I/O vector (niov). 0 = kernel default
+	 * (PAGE_SIZE). Must be a power of two and >= PAGE_SIZE when non-zero.
+	 */
+	__u32 rx_page_size;
 	struct sockaddr_in6 addr;
 
 	__u8 validate;
